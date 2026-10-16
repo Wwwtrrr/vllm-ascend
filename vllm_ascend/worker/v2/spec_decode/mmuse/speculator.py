@@ -10,6 +10,11 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpec
 
 
 class AscendMMuseSpeculator(MMuseGreedyRolloutMixin, AscendDFlashSpeculator):
+    def _mmuse_gumbel_sample(self, *args, **kwargs):
+        from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
+
+        return gumbel_sample(*args, **kwargs)
+
     _speculator_name = "MMuse"
 
     def __init__(self, vllm_config, device):
