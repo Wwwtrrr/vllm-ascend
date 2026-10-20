@@ -370,11 +370,6 @@ class ModelWithContext(nn.Module):
     def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor):
         return self.original_model.compute_confidence(head_hidden, markov_embed)
 
-    def rollout_mmuse(self, *args, **kwargs):
-        # MMuse correction runs after decoder.forward during FULL capture.
-        # v0.30's wrapper has no generic __getattr__ delegation.
-        return self.original_model.rollout_mmuse(*args, **kwargs)
-
     if not vllm_version_is("0.30.0"):
 
         def __getattr__(self, name: str):
