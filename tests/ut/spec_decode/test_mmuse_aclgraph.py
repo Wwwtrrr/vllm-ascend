@@ -73,20 +73,18 @@ def replay_class():
     return namespace["DFlashAclGraphManager"], active
 
 
-@pytest.mark.parametrize("prepared", [True, False])
 @pytest.mark.parametrize("updatable", [True, False])
 @pytest.mark.parametrize("fail", [True, False])
-def test_acl_replay_reuses_metadata_and_restores_current_config(replay_class, prepared, updatable, fail):
+def test_acl_replay_builds_draft_metadata_like_dspark(replay_class, updatable, fail):
     cls, active = replay_class
     obj = cls()
     obj.vllm_config = object()
     metadata = {"draft_layer": object()}
+    upper_bound = object()
     speculator = SimpleNamespace(
         attn_backends={"draft_layer": "updatable" if updatable else "legacy"},
-        input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=object()),
+        input_batch=SimpleNamespace(seq_lens_cpu_upper_bound=upper_bound),
         build_draft_attn_metadatas=Mock(return_value=[metadata]),
-        _update_draft_attn_metadata=Mock(),
-        _mmuse_replay_attn_metadata=metadata if prepared else None,
     )
     obj.speculator = speculator
 
@@ -106,11 +104,6 @@ def test_acl_replay_reuses_metadata_and_restores_current_config(replay_class, pr
     else:
         assert obj.run_fullgraph(desc) == "submitted"
     assert not active
-    if prepared:
-        speculator.build_draft_attn_metadatas.assert_not_called()
-        speculator._update_draft_attn_metadata.assert_called_once_with(metadata, 4)
-    else:
-        speculator.build_draft_attn_metadatas.assert_called_once()
-        speculator._update_draft_attn_metadata.assert_not_called()
+    speculator.build_draft_attn_metadatas.assert_called_once_with(4, upper_bound)
     assert obj._updatable_graph_replay.call_count == int(updatable)
     assert obj._graph_replay.call_count == int(not updatable)

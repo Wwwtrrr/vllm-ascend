@@ -121,15 +121,10 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
     def _run_fullgraph_with_config(self, desc):
         num_tokens = desc.num_tokens
         attn_backend = list(self.speculator.attn_backends.values())[0]
-        prepared = getattr(self.speculator, "_mmuse_replay_attn_metadata", None)
-        if prepared is None:
-            draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
-                desc.num_reqs,
-                self.speculator.input_batch.seq_lens_cpu_upper_bound,
-            )
-        else:
-            self.speculator._update_draft_attn_metadata(prepared, desc.num_reqs)
-            draft_attn_metadatas = [prepared]
+        draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
+            desc.num_reqs,
+            self.speculator.input_batch.seq_lens_cpu_upper_bound,
+        )
         if use_updatable_graph(attn_backend):
             return self._updatable_graph_replay(desc, draft_attn_metadatas)
         else:
@@ -143,13 +138,8 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # calculate num_tokens_across_dp.
         num_tokens_across_dp = torch.full([self.speculator.dp_size], num_tokens)
 
-        replay_metadata = (
-            draft_attn_metadatas[0]
-            if getattr(self.speculator, "_mmuse_replay_attn_metadata", None) is not None
-            else self.speculator.model_state.attn_metadata
-        )
         with set_forward_context(
-            replay_metadata,
+            self.speculator.model_state.attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
             cudagraph_runtime_mode=desc.cg_mode,
