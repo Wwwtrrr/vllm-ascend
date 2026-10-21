@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
-import copy
 import math
 from collections import defaultdict
 from dataclasses import replace
@@ -20,7 +19,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
-    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
@@ -392,25 +390,7 @@ def _ascend_get_packed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Preserve Ascend's DSV4 grouping on the live packed-group hook."""
-    speculation = vllm_config.speculative_config
-    dense_mmuse = (
-        speculation is not None
-        and speculation.method == "mmuse"
-        and vllm_config.model_config.hf_config.model_type == "deepseek_v4"
-    )
-    dense_specs = (
-        {name: spec for name, spec in kv_cache_spec.items() if type(spec) in (FullAttentionSpec, SlidingWindowSpec)}
-        if dense_mmuse
-        else {}
-    )
-    native_specs = {name: spec for name, spec in kv_cache_spec.items() if name not in dense_specs}
-    if dense_specs and native_specs:
-        # Native DeepSeek grouping intentionally only consumes MLA specs.
-        # Plan the dense drafter separately so none of its layers are dropped.
-        groups = _ascend_get_packed_kv_cache_groups(vllm_config, native_specs)
-        assert groups is not None
-        groups = [*groups, *_orig_get_kv_cache_groups(vllm_config, dense_specs)]
-    elif is_deepseek_v41_cache(kv_cache_spec):
+    if is_deepseek_v41_cache(kv_cache_spec):
         grouped_specs = group_cache_specs(kv_cache_spec)
         groups = make_cache_groups(grouped_specs)
     else:
@@ -425,66 +405,11 @@ def _ascend_get_packed_kv_cache_groups(
         groups,
         **({"use_deepseek_v4_fallback": True} if vllm_version_is("0.30.0") else {"use_trailing_layer_fallback": True}),
     )
-    if dense_specs and native_specs:
-        # Recursive target-only grouping can mark its last layer via the MTP
-        # fallback. Replace that guess with the exact dense-draft ownership.
-        for group in groups:
-            group.is_eagle_group = bool(group.layer_names) and all(name in dense_specs for name in group.layer_names)
     vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(
         vllm_config,
         groups,
     )
     return groups
-
-
-def _split_dsv4_dense_groups(groups):
-    """Separate native DSV4 tuples from dense draft groups without rewriting specs."""
-    native, dense = [], []
-    for group in groups:
-        spec = group.kv_cache_spec
-        specs = tuple(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
-        if specs and all(isinstance(item, (MLAAttentionSpec, SlidingWindowMLASpec)) for item in specs):
-            native.append(group)
-        elif specs and all(type(item) in (FullAttentionSpec, SlidingWindowSpec) for item in specs):
-            dense.append(group)
-        else:
-            return None
-    return (native, dense) if dense and _is_deepseek_v4_groups(native) else None
-
-
-def _dense_cache_layers(groups):
-    for group in groups:
-        spec = group.kv_cache_spec
-        for name in group.layer_names:
-            yield name, spec.kv_cache_specs[name] if isinstance(spec, UniformTypeKVCacheSpecs) else spec
-
-
-def _dsv4_dense_cache_config(vllm_config, groups, available_memory):
-    native, dense = _split_dsv4_dense_groups(groups)
-    native_cost = _ascend_pool_bytes_per_block(native)
-    dense_layers = list(_dense_cache_layers(dense))
-    cost = native_cost + sum(spec.page_size_bytes for _, spec in dense_layers)
-    blocks = may_override_num_blocks(vllm_config, available_memory // cost)
-    planning = copy.copy(vllm_config)
-    planning.cache_config = copy.copy(vllm_config.cache_config)
-    planning.cache_config.num_gpu_blocks_override = blocks
-    native_blocks, tensors = _get_kv_cache_config_deepseek_v4_main(planning, native, blocks * native_cost)
-    if native_blocks != blocks:
-        raise ValueError("DeepSeek-V4 MMuse native/dense cache block counts differ")
-    total = blocks * cost
-    tensors = [replace(tensor, size=total) for tensor in tensors]
-    offset = blocks * native_cost
-    for name, spec in dense_layers:
-        tensors.append(
-            KVCacheTensor(size=total, layers=[name], offset=offset, layer_stride=0, block_stride=spec.page_size_bytes)
-        )
-        offset += blocks * spec.page_size_bytes
-    return KVCacheConfig(
-        num_blocks=blocks,
-        kv_cache_tensors=tensors,
-        kv_cache_groups=groups,
-        prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
-    )
 
 
 def _get_deepseek_v4_cache_layout(
@@ -622,12 +547,6 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     layout, so using the upstream value changes ``num_blocks`` during the
     re-plan and leaves ranks inconsistent.
     """
-    mixed = _split_dsv4_dense_groups(kv_cache_groups)
-    if mixed is not None:
-        native, dense = mixed
-        return _ascend_pool_bytes_per_block(native) + sum(
-            spec.page_size_bytes for _, spec in _dense_cache_layers(dense)
-        )
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -646,15 +565,6 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
-    if _split_dsv4_dense_groups(kv_cache_groups) is not None:
-        pages = 0
-        for group in kv_cache_groups:
-            spec = group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                pages += spec.max_memory_usage_pages(vllm_config)
-            else:
-                pages += cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
-        return pages * _ascend_pool_bytes_per_block(kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -702,9 +612,7 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
-    if _split_dsv4_dense_groups(kv_cache_groups) is not None:
-        kv_cache_config = _dsv4_dense_cache_config(vllm_config, kv_cache_groups, available_memory)
-    elif is_deepseek_v41_cache(kv_cache_groups):
+    if is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
