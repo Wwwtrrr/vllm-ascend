@@ -10,6 +10,23 @@ from types import SimpleNamespace as NS
 import torch
 
 
+def test_mmuse_trace_option_is_not_forwarded_to_ascend_config():
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/ascend_config.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    factory = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "init_ascend_config")
+    excluded = next(
+        node.value
+        for node in ast.walk(factory)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_NON_USER_INPUT_KEYS" for target in node.targets)
+    )
+    keys = eval(compile(ast.Expression(excluded), str(path), "eval"), {"_RUNTIME_CONFIG_STRIP_KEYS": set()})
+    additional_config = {"mmuse_trace_steps": 4, "enable_fused_mc2": 0}
+    forwarded = {key: value for key, value in additional_config.items() if key not in keys}
+    assert forwarded == {"enable_fused_mc2": 0}
+    assert additional_config["mmuse_trace_steps"] == 4
+
+
 def test_reference_proposer_uses_ascend_sampler(monkeypatch):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/mmuse/reference.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))

@@ -1836,6 +1836,9 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     # These are stripped so that only user-configurable keys reach pydantic,
     # where extra="forbid" can reject unknown options.
     _NON_USER_INPUT_KEYS = {
+        # Consumed by the upstream MMuse proposer, not by AscendConfig.
+        # Preserve it in vllm_config.additional_config for worker construction.
+        "mmuse_trace_steps",
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",
         # Upstream-injected by EngineArgs for the generic GDN/KDA prefill
