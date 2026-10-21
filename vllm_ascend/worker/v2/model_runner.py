@@ -1120,6 +1120,10 @@ class NPUModelRunner(GPUModelRunner):
                 grammar_output.grammar_bitmask,
             )
 
+        trace_target = getattr(self.speculator, "trace_target", None)
+        if trace_target is not None:
+            trace_target(logits, input_batch)
+
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
