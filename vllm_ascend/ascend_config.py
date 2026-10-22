@@ -1838,7 +1838,6 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     _NON_USER_INPUT_KEYS = {
         # Consumed by the upstream MMuse proposer, not by AscendConfig.
         # Preserve it in vllm_config.additional_config for worker construction.
-        "mmuse_trace_steps",
         "mmuse_draft_kv_reuse",
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",

@@ -11,7 +11,7 @@ import pytest
 import torch
 
 
-def test_mmuse_trace_option_is_not_forwarded_to_ascend_config():
+def test_mmuse_kv_option_is_not_forwarded_to_ascend_config():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/ascend_config.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     factory = next(
@@ -24,10 +24,9 @@ def test_mmuse_trace_option_is_not_forwarded_to_ascend_config():
         and any(isinstance(target, ast.Name) and target.id == "_NON_USER_INPUT_KEYS" for target in node.targets)
     )
     keys = eval(compile(ast.Expression(excluded), str(path), "eval"), {"_RUNTIME_CONFIG_STRIP_KEYS": set()})
-    additional_config = {"mmuse_trace_steps": 4, "mmuse_draft_kv_reuse": True, "enable_fused_mc2": 0}
+    additional_config = {"mmuse_draft_kv_reuse": True, "enable_fused_mc2": 0}
     forwarded = {key: value for key, value in additional_config.items() if key not in keys}
     assert forwarded == {"enable_fused_mc2": 0}
-    assert additional_config["mmuse_trace_steps"] == 4
     assert additional_config["mmuse_draft_kv_reuse"] is True
 
 
@@ -69,30 +68,3 @@ def test_quarot_resolves_bundled_matrix_and_rejects_missing_file(monkeypatch, tm
         proposer.get_target_rotation()
     utils.get_rotation_path = lambda _: None
     assert proposer.get_target_rotation() is None
-
-
-def test_lmhead_tp_trace_receives_trimmed_logits_before_verification():
-    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/model_runner.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
-    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "sample")
-    namespace = dict(lmhead_tp_enable=lambda: True, lmhead_tp_pad_rows=lambda *args: torch.tensor([0, 1, 0, 0]))
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    events = []
-    batch = NS(logits_indices=torch.tensor([0, 1]), num_draft_tokens=1)
-    output = NS(num_sampled=torch.tensor([1]), num_rejected=torch.tensor([1]))
-
-    def verify(logits, actual_batch, draft_logits):
-        events.append(("verify", tuple(logits.shape)))
-        assert actual_batch is batch
-        return output
-
-    runner = NS(
-        _lmhead_tp_max_num_logits=lambda: 4,
-        model=NS(compute_logits=lambda hidden: torch.zeros(hidden.shape[0], 8)),
-        speculator=NS(draft_logits=None, trace_target=lambda logits, _: events.append(("trace", tuple(logits.shape)))),
-        rejection_sampler=verify,
-    )
-    result = namespace["sample"](runner, torch.zeros(4, 3), batch, None)
-    assert events == [("trace", (2, 8)), ("verify", (2, 8))]
-    assert result[0] is output

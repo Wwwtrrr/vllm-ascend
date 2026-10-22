@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NPU sampler binding for the stateless MMuse reference drafter."""
+"""NPU sampling and QuaRot binding for the MMuse reference drafter."""
 
 from vllm.v1.worker.gpu.spec_decode.mmuse.reference import MMuseReferenceSpeculator
 
