@@ -24,10 +24,11 @@ def test_mmuse_trace_option_is_not_forwarded_to_ascend_config():
         and any(isinstance(target, ast.Name) and target.id == "_NON_USER_INPUT_KEYS" for target in node.targets)
     )
     keys = eval(compile(ast.Expression(excluded), str(path), "eval"), {"_RUNTIME_CONFIG_STRIP_KEYS": set()})
-    additional_config = {"mmuse_trace_steps": 4, "enable_fused_mc2": 0}
+    additional_config = {"mmuse_trace_steps": 4, "mmuse_draft_kv_reuse": True, "enable_fused_mc2": 0}
     forwarded = {key: value for key, value in additional_config.items() if key not in keys}
     assert forwarded == {"enable_fused_mc2": 0}
     assert additional_config["mmuse_trace_steps"] == 4
+    assert additional_config["mmuse_draft_kv_reuse"] is True
 
 
 def test_reference_proposer_uses_ascend_sampler(monkeypatch):
