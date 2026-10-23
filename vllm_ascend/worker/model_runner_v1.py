@@ -782,6 +782,8 @@ class NPUModelRunner(GPUModelRunner):
         self._replay_active = False
 
     def _get_drafter(self):
+        if self.speculative_config.use_mmuse():
+            raise ValueError("MMuse requires Model Runner V2")
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
 
     def _eagle3_uses_aux_hidden_state(self) -> bool:
