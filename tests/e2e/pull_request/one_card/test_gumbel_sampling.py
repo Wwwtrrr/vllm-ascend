@@ -61,6 +61,76 @@ def _ref_apply_temperature(
 
 
 class TestGumbelSampling:
+    @pytest.mark.parametrize("temperature_value", [1.0, 0.7])
+    @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
+    def test_mmuse_probabilistic_proposal_and_rejection_preserve_target_distribution(
+        self, temperature_value, cache_dtype
+    ):
+        """Real MMuse sampler binding + native accept/resample, no model weights.
+
+        Distinct p/q distributions exercise accepted and corrected draws. Request
+        slots are reversed to catch local-row versus persistent-slot mistakes.
+        This kernel test must run on NPU; CPU tests do not replace it.
+        """
+        from vllm_ascend.worker.v2.spec_decode.mmuse.reference import AscendMMuseReferenceSpeculator
+
+        count, vocab = 8192, 8
+        mapping = torch.arange(count - 1, -1, -1, dtype=torch.int32, device=DEVICE)
+        temperatures = torch.full((count,), temperature_value, dtype=torch.float32, device=DEVICE)
+        seeds = torch.arange(count, dtype=torch.int64, device=DEVICE) * 733 + 17
+        query_positions = torch.full((count,), 101, dtype=torch.int32, device=DEVICE)
+        raw_draft = torch.tensor([2.0, 0.0, -2.0, 1.0, -1.0, 0.5, -0.5, 0.2], device=DEVICE)
+        raw_draft = raw_draft.to(cache_dtype)
+        raw_target = torch.tensor([0.0, 2.0, 1.0, -1.0, 0.5, -0.5, 0.2, -2.0], device=DEVICE)
+        logits = raw_draft.expand(count, vocab).contiguous()
+        cache = torch.full((count, 1, vocab), float("nan"), dtype=cache_dtype, device=DEVICE)
+        speculator = AscendMMuseReferenceSpeculator.__new__(AscendMMuseReferenceSpeculator)
+        proposed = speculator.sample(
+            logits,
+            mapping,
+            temperatures,
+            seeds,
+            query_positions,
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=cache,
+            logits_cache_col=torch.zeros_like(mapping),
+            use_fp64=False,
+        )
+        torch.testing.assert_close(cache[mapping.long(), 0], logits, atol=0, rtol=0)
+        # Target logits enter rejection_sample AFTER sampling-parameter scaling.
+        target_logits = (raw_target / temperature_value).expand(count * 2, vocab).contiguous()
+        draft_sampled = torch.stack((torch.zeros_like(proposed), proposed), dim=1).reshape(-1)
+        expanded_mapping = mapping.repeat_interleave(2)
+        local_positions = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE).repeat(count)
+        positions = torch.tensor([101, 102], dtype=torch.int32, device=DEVICE).repeat(count)
+        sampled, num_sampled = rejection_sample(
+            target_logits,
+            cache,
+            draft_sampled,
+            torch.arange(0, count * 2 + 1, 2, dtype=torch.int32, device=DEVICE),
+            positions,
+            mapping,
+            expanded_mapping,
+            local_positions,
+            temperatures,
+            seeds,
+            num_speculative_steps=1,
+            use_fp64=False,
+        )
+        torch.npu.synchronize()
+        p = torch.softmax(raw_target.cpu().double() / temperature_value, -1)
+        q = torch.softmax(raw_draft.cpu().double() / temperature_value, -1)
+        proposed_hist = torch.bincount(proposed.cpu(), minlength=vocab).double() / count
+        output_hist = torch.bincount(sampled[:, 0].cpu(), minlength=vocab).double() / count
+        expected_acceptance = torch.minimum(p, q).sum().item()
+        actual_acceptance = (num_sampled.cpu() == 2).double().mean().item()
+        # Broad statistical bounds avoid treating exact RNG sequences as a contract.
+        torch.testing.assert_close(proposed_hist, q, atol=0.035, rtol=0)
+        torch.testing.assert_close(output_hist, p, atol=0.035, rtol=0)
+        assert abs(actual_acceptance - expected_acceptance) < 0.035
+        assert 0 < actual_acceptance < 1
+
     @pytest.mark.parametrize(
         "num_tokens,vocab_size",
         [

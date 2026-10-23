@@ -35,6 +35,14 @@ def init_speculator(
         vllm_config = copy.copy(vllm_config)
         vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)
         vllm_config.compilation_config.mode = CompilationMode.NONE
+    if speculative_config.use_mmuse():
+        if vllm_config.model_config.hf_config.model_type == "deepseek_v4":
+            from vllm_ascend.worker.v2.spec_decode.mmuse.reference import AscendMMuseReferenceSpeculator
+
+            return AscendMMuseReferenceSpeculator(vllm_config, device)
+        from vllm_ascend.worker.v2.spec_decode.mmuse.speculator import AscendMMuseSpeculator
+
+        return AscendMMuseSpeculator(vllm_config, device)
     if speculative_config.method == "extract_hidden_states":
         # No Ascend-specific behavior beyond update_stream assignment in
         # NPUModelRunner; reuse upstream ExtractHiddenStatesSpeculator as-is.
