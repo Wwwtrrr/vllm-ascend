@@ -160,13 +160,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ):
         # vLLM main (#51700) passes the microbatch runner into the graph
         # manager.
-        # Keep Qwen3 decode capture shaped like runtime decode. A mixed FULL
-        # graph may select FIA where one-token decode can use paged attention.
-        self.specialize_full_decode = (
-            vllm_config.model_config.hf_config.model_type == "qwen3"
-            and cudagraph_mode == CUDAGraphMode.FULL
-            and not varlen_decode
-        )
         super().__init__(
             vllm_config,
             device,
