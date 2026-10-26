@@ -370,6 +370,11 @@ class ModelWithContext(nn.Module):
     def compute_confidence(self, head_hidden: torch.Tensor, markov_embed: torch.Tensor):
         return self.original_model.compute_confidence(head_hidden, markov_embed)
 
+    def rollout_mmuse(self, hidden, anchor_ids, **kwargs):
+        # MMuse's outer graph captures Decoder + Correction/Selector rollout.
+        # Keep this available even on versions without generic attribute forwarding.
+        return self.original_model.rollout_mmuse(hidden, anchor_ids, **kwargs)
+
     if not vllm_version_is("0.30.0"):
 
         def __getattr__(self, name: str):
