@@ -945,3 +945,26 @@ Upstream vLLM's synthetic path draws the per-token uniform numbers with `tl_rand
 - **MRV2** (`vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py`, used when the V2 model runner is enabled): the uniform draw is generated **inside** `_probabilistic_rejection_kernel` with `SYNTHETIC_MODE=True`, using a 1-element-block fp32 `tl.rand` clamped to `[2^-31, 1)` — equivalent to upstream's `includes_zero=False` semantics. Both greedy and sampling temperatures are supported, and the first rejected position is followed by a resampled/bonus token from the target distribution, as in `standard` mode.
 
 The configuration interface (`rejection_sample_method`, `synthetic_acceptance_rates`, `synthetic_acceptance_length`) is identical on both paths.
+
+## Qwen3 MMuse independent FULL path
+
+Greedy Qwen3 MMuse on Model Runner V2 selects
+`AscendMMuseGreedySpeculator` and `MMuseAclGraphManager`, independently of the
+DFlash proposer and graph manager. Target retains the native Ascend graph path.
+Draft captures query decoder plus greedy rollout; context K/V projection and
+query preparation run outside capture. The Draft disables Dynamo compilation
+on a copied configuration without disabling native ACL graph capture.
+
+For K=7, BS1, use Target `enforce_eager=False`, Draft `enforce_eager=False`,
+`draft_sample_method="greedy"`, and
+`compilation_config={"mode": 0, "cudagraph_mode": "FULL", "cudagraph_capture_sizes": [7, 8]}`.
+Use TP/PP/DP/CP=1 and the updatable full-attention backend. For BS4 include capture
+sizes 28 and 32 as well. K must match the trained checkpoint block size.
+Probabilistic MMuse and the DeepSeek reference path retain their eager contracts.
+
+Replay resolves attention tasks from current-step metadata once and preserves
+native update-stream ordering. Required waits are retained. This implementation
+does not claim a MEM_WAIT performance fix or native NPU acceptance without
+server validation. Compare NONE, Target FULL with eager Draft, and both FULL
+after warmup using the same requests. Check tokens, acceptance, request-slot
+reuse, EOS, latency and memory before measuring unprofiled throughput.

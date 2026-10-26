@@ -40,6 +40,10 @@ def init_speculator(
             from vllm_ascend.worker.v2.spec_decode.mmuse.reference import AscendMMuseReferenceSpeculator
 
             return AscendMMuseReferenceSpeculator(vllm_config, device)
+        if speculative_config.draft_sample_method == "greedy":
+            from vllm_ascend.worker.v2.spec_decode.mmuse.greedy import AscendMMuseGreedySpeculator
+
+            return AscendMMuseGreedySpeculator(vllm_config, device)
         from vllm_ascend.worker.v2.spec_decode.mmuse.speculator import AscendMMuseSpeculator
 
         return AscendMMuseSpeculator(vllm_config, device)
