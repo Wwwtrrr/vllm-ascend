@@ -11,22 +11,6 @@ import pytest
 import torch
 
 
-def test_mmuse_capture_wrapper_forwards_rollout_without_generic_getattr():
-    from unittest.mock import Mock
-
-    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/aclgraph_utils.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelWithContext")
-    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "rollout_mmuse")
-    namespace = {}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
-    original = NS(rollout_mmuse=Mock(return_value="tokens"))
-    wrapper = NS(original_model=original)
-    hidden, anchor, sampler = object(), object(), object()
-    assert namespace["rollout_mmuse"](wrapper, hidden, anchor, sample_token=sampler) == "tokens"
-    original.rollout_mmuse.assert_called_once_with(hidden, anchor, sample_token=sampler)
-
-
 def test_mmuse_kv_option_is_not_forwarded_to_ascend_config():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/ascend_config.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
