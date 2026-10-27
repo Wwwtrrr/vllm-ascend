@@ -960,7 +960,24 @@ For K=7, BS1, use Target `enforce_eager=False`, Draft `enforce_eager=False`,
 `compilation_config={"mode": 0, "cudagraph_mode": "FULL", "cudagraph_capture_sizes": [7, 8]}`.
 Use TP/PP/DP/CP=1 and the updatable full-attention backend. For BS4 include capture
 sizes 28 and 32 as well. K must match the trained checkpoint block size.
-Probabilistic MMuse and the DeepSeek reference path retain their eager contracts.
+The DeepSeek reference path retains its eager contract.
+
+Qwen3 probabilistic MMuse selects `AscendMMuseProbabilisticSpeculator`, extending
+our independent query/ACL graph path. Set `draft_sample_method="probabilistic"`
+with both `enforce_eager=False` and the same FULL settings. The graph includes
+native NPU Gumbel sampling, pre-temperature logits caching and sampled-token
+feedback. Request mapping, seeds, temperature and absolute positions are updated
+in persistent buffers before replay. Padded/dummy rows use index -1 and never
+write live cache entries. FP64 Gumbel, watermarking and adaptive verification
+remain unsupported. Greedy MMuse keeps its existing path.
+
+Start validation with a fixed request seed, temperature 0.7, top_p=1, top_k=-1
+and repetition penalty 1. Run vLLM's
+`tests/v1/spec_decode/test_mmuse_probabilistic_graph.py` in the installed NPU
+environment for synthetic head/sampler capture parity. Ascend's
+`tests/ut/spec_decode/test_mmuse_probabilistic_graph.py` checks sampler binding
+and unsupported FP64. Full-model paged attention, rejection/resampling, EOS,
+request-slot reuse and output-distribution validation still require server runs.
 
 Replay resolves attention tasks from current-step metadata once and preserves
 native update-stream ordering. Required waits are retained. This implementation
