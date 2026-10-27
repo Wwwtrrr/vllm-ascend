@@ -37,6 +37,10 @@ def init_speculator(
         vllm_config.compilation_config.mode = CompilationMode.NONE
     if speculative_config.use_mmuse():
         if vllm_config.model_config.hf_config.model_type == "deepseek_v4":
+            if not speculative_config.enforce_eager:
+                from vllm_ascend.worker.v2.spec_decode.mmuse.deepseek_full import AscendDeepseekMMuseFullSpeculator
+
+                return AscendDeepseekMMuseFullSpeculator(vllm_config, device)
             from vllm_ascend.worker.v2.spec_decode.mmuse.reference import AscendMMuseReferenceSpeculator
 
             return AscendMMuseReferenceSpeculator(vllm_config, device)

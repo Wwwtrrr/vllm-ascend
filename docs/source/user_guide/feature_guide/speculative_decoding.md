@@ -960,7 +960,7 @@ For K=7, BS1, use Target `enforce_eager=False`, Draft `enforce_eager=False`,
 `compilation_config={"mode": 0, "cudagraph_mode": "FULL", "cudagraph_capture_sizes": [7, 8]}`.
 Use TP/PP/DP/CP=1 and the updatable full-attention backend. For BS4 include capture
 sizes 28 and 32 as well. K must match the trained checkpoint block size.
-The DeepSeek reference path retains its eager contract.
+DeepSeek has a separate replicated fixed-context query graph path described below.
 
 Qwen3 probabilistic MMuse selects `AscendMMuseProbabilisticSpeculator`, extending
 our independent query/ACL graph path. Set `draft_sample_method="probabilistic"`
@@ -985,3 +985,32 @@ does not claim a MEM_WAIT performance fix or native NPU acceptance without
 server validation. Compare NONE, Target FULL with eager Draft, and both FULL
 after warmup using the same requests. Check tokens, acceptance, request-slot
 reuse, EOS, latency and memory before measuring unprofiled throughput.
+
+## DeepSeek W4A8 Target with MMuse FULL Draft
+
+Keep the working DeepSeek W4A8 Target FULL configuration and use method="mmuse",
+the DeepSeek MMuse checkpoint, BF16 activations, unquantized Draft, and disabled
+prefix caching. Target and Draft can both set `enforce_eager=False`.
+`AscendDeepseekMMuseFullSpeculator` retains the teacher IO/declared QuaRot contract
+and uses native NPUGraph capture for the replicated pure-Torch Draft decoder.
+It does not replace Target attention, quantization or graph updates.
+
+History update and fixed-capacity context K/V preparation stay outside capture;
+the query decoder and complete greedy/probabilistic rollout are captured per
+context-size bucket. Each request replays serially with independent copied
+output and request-indexed probability caches. Padding context positions -1
+are masked. The older `mmuse_draft_kv_reuse` option must be disabled on this path.
+Draft `enforce_eager=True` retains the Eager reference with optional KV reuse.
+
+For K=7, BS1 Target verification can use capture size 8; BS4 also needs 32.
+Preserve smaller Target shapes needed by the existing workload. Draft captures
+are selected by confirmed-context capacity rather than Target token counts.
+PP/DP/CP remain one, while each Target TP rank runs a replicated Draft.
+FP64 Gumbel, watermarking and adaptive verification remain unsupported.
+
+Additional context buffers and padding cost memory/compute. CPU history reads
+remain, so this change does not promise to fix synchronization overhead or
+improve throughput. Run vLLM's `test_mmuse_deepseek_graph.py` on the NPU for
+synthetic native decoder/head/sampler graph checks, then validate actual W4A8
+auxiliary mean-HC features, rotation alignment, acceptance and full-model output
+against Eager before measuring performance without profiling.
