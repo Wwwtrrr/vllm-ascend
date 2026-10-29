@@ -616,3 +616,68 @@ def test_framework_cache_validation_rejects_malformed_pairs(invalid):
     arena = attention_module().FrameworkContextAttention(owner, torch.empty(1, 256, 128), 7)
     with pytest.raises(ValueError, match="MMuse framework FIA"):
         arena.prepare_for_capture()
+
+
+@torch.inference_mode()
+def test_native_framework_decoder_primitives_and_graph_replay():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("NPU required")
+    import copy
+
+    from vllm.config import VllmConfig
+    from vllm.model_executor.models.mmuse.deepseek_decoder import RMS, BlockLayer
+    from vllm.model_executor.models.mmuse.framework_decoder import bind_framework_decoder
+
+    import vllm_ascend.ops  # noqa: F401
+
+    class Owner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = torch.nn.Linear(256, 128, bias=False)
+            self.runtime = torch.nn.Module()
+            self.runtime.fc = self.fc
+            self.hidden_norm, self.norm = RMS(128, 1e-6), RMS(128, 1e-6)
+            config = NS(
+                hidden_size=128,
+                intermediate_size=256,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=64,
+                attention_bias=True,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+            )
+            self.layers = torch.nn.ModuleList([BlockLayer(config, {}, 4), BlockLayer(config, {}, None)])
+
+    torch.manual_seed(123)
+    owner = Owner().eval().to(device="npu", dtype=torch.bfloat16)
+    original = copy.deepcopy(owner)
+    config = VllmConfig()
+    config.compilation_config.custom_ops = ["all"]
+    config.model_config = NS(max_model_len=64)
+    config.speculative_config = NS(num_speculative_tokens=3, method="mmuse")
+    bind_framework_decoder(owner, config)
+    query = torch.randn(3, 128, dtype=torch.bfloat16, device="npu")
+    context = torch.randn(9, 128, dtype=query.dtype, device=query.device)
+    positions = torch.arange(7, 10, device="npu")
+    context_positions = torch.arange(-1, 8, device="npu")
+
+    def forward(model):
+        hidden = query
+        for layer in model.layers:
+            hidden = layer(hidden, context, positions, context_positions)
+        return model.norm(hidden)
+
+    torch.testing.assert_close(forward(owner), forward(original), atol=0.06, rtol=0.03)
+    for _ in range(3):
+        forward(owner)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = forward(owner)
+    query.add_(0.1)
+    expected = forward(owner)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(output, expected, atol=0.01, rtol=0.01)

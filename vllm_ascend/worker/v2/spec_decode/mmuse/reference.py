@@ -31,8 +31,11 @@ class AscendMMuseReferenceSpeculator(MMuseReferenceSpeculator):
                     self.num_query_per_req,
                 )
         if backend == "ascend_framework_fia":
+            from vllm.model_executor.models.mmuse.framework_decoder import bind_framework_decoder
+
             from vllm_ascend.worker.v2.spec_decode.mmuse.attention import bind_framework_attention
 
+            bind_framework_decoder(model, self.vllm_config)
             bind_framework_attention(model, self.vllm_config, self.num_query_per_req)
 
     def get_target_rotation(self):

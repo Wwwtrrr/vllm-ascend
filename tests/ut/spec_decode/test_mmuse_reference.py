@@ -42,6 +42,10 @@ def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, back
     module.PagedContextAttention = lambda *args: page_backend
     framework_calls = []
     module.bind_framework_attention = lambda *args: framework_calls.append(args)
+    primitives = ModuleType("vllm.model_executor.models.mmuse.framework_decoder")
+    primitive_calls = []
+    primitives.bind_framework_decoder = lambda *args: primitive_calls.append(args)
+    monkeypatch.setitem(sys.modules, primitives.__name__, primitives)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     proposer = namespace[cls.name]()
     proposer.num_query_per_req = 3
@@ -57,6 +61,7 @@ def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, back
         assert attention.attention_impl is expected
         assert attention.paged_attention_impl is (page_backend if backend == "ascend_paged_fia" else None)
         assert len(framework_calls) == (1 if backend == "ascend_framework_fia" else 0)
+        assert len(primitive_calls) == len(framework_calls)
 
 
 def test_reference_proposer_uses_ascend_sampler(monkeypatch):
