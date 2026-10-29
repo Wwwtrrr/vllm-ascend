@@ -5,6 +5,7 @@ import ast
 import importlib.util
 import sys
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -448,3 +449,145 @@ def test_fia_preserves_gqa_and_explicit_anchor_mask(monkeypatch, query_heads, kv
         graph.replay()
         torch.npu.synchronize()
         torch.testing.assert_close(output, expected, atol=0.03, rtol=0.03)
+
+
+def test_deepseek_mixed_mmuse_cache_groups_cover_layers_and_budget_shared_backing():
+    """Dense Draft pages must survive MLA grouping and rank capacity re-plans."""
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/patch/platform/patch_kv_cache_utils.py"
+    tree = ast.parse(path.read_text())
+    names = {
+        "_ascend_get_packed_kv_cache_groups",
+        "_split_mmuse_cache_groups",
+        "_mmuse_page_bytes",
+        "_ascend_pool_bytes_per_block",
+        "_ascend_max_memory_usage_bytes_from_groups",
+        "_ascend_get_kv_cache_config_from_groups",
+    }
+
+    class Full:
+        def __init__(self, page):
+            self.page_size_bytes = page
+
+        def max_memory_usage_bytes(self, config):
+            return self.page_size_bytes * 4
+
+    class MLA(Full):
+        model_version = "deepseek_v4"
+
+    class SWA(MLA):
+        pass
+
+    class Uniform:
+        def __init__(self, specs):
+            self.kv_cache_specs = specs
+
+        @classmethod
+        def from_specs(cls, specs):
+            return cls(specs)
+
+    @dataclass
+    class Tensor:
+        size: int
+        layers: list
+        offset: int
+        layer_stride: int
+        block_stride: int
+
+    def group(names, spec):
+        return NS(layer_names=names, kv_cache_spec=spec)
+
+    def target_grouping(config, specs):
+        assert all(isinstance(spec, MLA) for spec in specs.values())
+        return [group([name], Uniform({name: spec})) for name, spec in specs.items()]
+
+    def layout(groups):
+        # The target's two groups overlay one target-only backing region.
+        return [16], [], [], 0, 2
+
+    def target_config(config, groups, memory):
+        assert all(isinstance(spec, MLA) for g in groups for spec in g.kv_cache_spec.kv_cache_specs.values())
+        count = memory // 32
+        tensors = [Tensor(32 * count, g.layer_names, 0, 0, 16) for g in groups]
+        return NS(num_blocks=count, kv_cache_tensors=tensors, kv_cache_groups=groups)
+
+    config = NS(
+        kv_transfer_config=None,
+        speculative_config=NS(method="mmuse"),
+        cache_config=NS(prefix_cache_retention_interval=1, num_gpu_blocks_override=None),
+    )
+    scope = dict(
+        VllmConfig=object,
+        KVCacheSpec=object,
+        KVCacheGroupSpec=group,
+        FullAttentionSpec=Full,
+        MLAAttentionSpec=MLA,
+        SlidingWindowMLASpec=SWA,
+        UniformTypeKVCacheSpecs=Uniform,
+        KVCacheConfig=NS,
+        KVCacheTensor=Tensor,
+        replace=replace,
+        is_deepseek_v41_cache=lambda groups: False,
+        group_and_unify_kv_cache_specs=lambda specs: specs,
+        _get_kv_cache_groups_uniform_groups=lambda specs: target_grouping(config, specs),
+        _is_deepseek_v4_groups=lambda groups: bool(groups),
+        _get_deepseek_v4_cache_layout=layout,
+        _get_kv_cache_config_deepseek_v4_main=lambda cfg, groups, mem: (
+            (result := target_config(cfg, groups, mem)).num_blocks,
+            result.kv_cache_tensors,
+        ),
+        _get_glm5_next_cache_layout=lambda groups: None,
+        may_override_num_blocks=lambda cfg, count: cfg.cache_config.num_gpu_blocks_override or count,
+        tq_cache=NS(uses_turboquant_groups=lambda groups: False),
+        vllm_version_is=lambda version: False,
+        vllm=NS(
+            v1=NS(
+                core=NS(
+                    kv_cache_utils=NS(
+                        _annotate_eagle_groups=lambda *args, **kwargs: None,
+                        _warn_if_unannotated_eagle_mamba=lambda *args: None,
+                    )
+                )
+            )
+        ),
+    )
+    exec(
+        compile(
+            ast.Module(
+                body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[]
+            ),
+            str(path),
+            "exec",
+        ),
+        scope,
+    )
+    target = {"model.layers.0.attn": MLA(16), "model.layers.0.swa": SWA(16)}
+    draft = {f"draft_model.layers.{i}.self_attn.attn": Full(64) for i in range(2)}
+    specs = target | draft
+    groups = scope["_ascend_get_packed_kv_cache_groups"](config, specs)
+    covered = [name for g in groups for name in g.layer_names]
+    assert len(covered) == len(specs) and set(covered) == set(specs)
+    divisor = scope["_ascend_pool_bytes_per_block"](groups)
+    assert divisor == 32 + 128
+    # Override normal target admission formula with its original result: the
+    # mixed wrapper must add Draft's memory, without repacking the Target.
+    original_memory = scope["_ascend_max_memory_usage_bytes_from_groups"]
+
+    def memory(cfg, current):
+        return original_memory(cfg, current) if len(current) > 2 else 128
+
+    scope["_ascend_max_memory_usage_bytes_from_groups"] = memory
+    assert memory(config, groups) == 128 + 512
+    for budget in [1600, 800]:
+        result = scope["_ascend_get_kv_cache_config_from_groups"](config, groups, budget)
+        assert result.num_blocks == budget // divisor
+        assert {tensor.size for tensor in result.kv_cache_tensors} == {budget}
+        assert result.kv_cache_groups is groups
+        target_end = result.num_blocks * 32
+        spans = [(t.offset, t.offset + result.num_blocks * t.block_stride) for t in result.kv_cache_tensors[2:]]
+        assert spans[0][0] == target_end
+        assert spans[0][1] == spans[1][0]
+        assert spans[1][1] == budget
+    config.cache_config.num_gpu_blocks_override = 3
+    result = scope["_ascend_get_kv_cache_config_from_groups"](config, groups, 1600)
+    assert result.num_blocks == 3
+    assert {t.size for t in result.kv_cache_tensors} == {3 * divisor}

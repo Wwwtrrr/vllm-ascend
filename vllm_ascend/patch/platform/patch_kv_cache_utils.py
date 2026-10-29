@@ -390,6 +390,24 @@ def _ascend_get_packed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Preserve Ascend's DSV4 grouping on the live packed-group hook."""
+    # DSV4's packed grouper only understands MLA. Keep the independently
+    # registered MMuse full-attention caches out of that target-only grouper.
+    mmuse_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name.startswith("draft_model.layers.")
+        and isinstance(spec, FullAttentionSpec)
+        and not isinstance(spec, MLAAttentionSpec)
+    }
+    if mmuse_specs and any(isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()):
+        target_specs = {name: spec for name, spec in kv_cache_spec.items() if name not in mmuse_specs}
+        groups = _ascend_get_packed_kv_cache_groups(vllm_config, target_specs)
+        assert groups is not None
+        for name, spec in mmuse_specs.items():
+            uniform = UniformTypeKVCacheSpecs.from_specs({name: spec})
+            assert uniform is not None
+            groups.append(KVCacheGroupSpec([name], uniform))
+        return groups
     if is_deepseek_v41_cache(kv_cache_spec):
         grouped_specs = group_cache_specs(kv_cache_spec)
         groups = make_cache_groups(grouped_specs)
@@ -538,6 +556,31 @@ def _is_deepseek_v4_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
     return False
 
 
+def _split_mmuse_cache_groups(groups):
+    """Separate dense Draft pages from DSV4's target-only tuple layout."""
+    draft = []
+    target = []
+    for group in groups:
+        specs = group.kv_cache_spec
+        is_draft = (
+            isinstance(specs, UniformTypeKVCacheSpecs)
+            and bool(group.layer_names)
+            and all(name.startswith("draft_model.layers.") for name in group.layer_names)
+            and all(
+                isinstance(spec, FullAttentionSpec) and not isinstance(spec, MLAAttentionSpec)
+                for spec in specs.kv_cache_specs.values()
+            )
+        )
+        (draft if is_draft else target).append(group)
+    if not draft or not _is_deepseek_v4_groups(target):
+        return groups, []
+    return target, draft
+
+
+def _mmuse_page_bytes(groups):
+    return sum(spec.page_size_bytes for group in groups for spec in group.kv_cache_spec.kv_cache_specs.values())
+
+
 def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     """Use the same DSV4 divisor as Ascend's shared-tuple planner.
 
@@ -547,6 +590,9 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     layout, so using the upstream value changes ``num_blocks`` during the
     re-plan and leaves ranks inconsistent.
     """
+    target, draft = _split_mmuse_cache_groups(kv_cache_groups)
+    if draft:
+        return _ascend_pool_bytes_per_block(target) + _mmuse_page_bytes(draft)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -565,6 +611,13 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
+    target, draft = _split_mmuse_cache_groups(kv_cache_groups)
+    if draft:
+        return _ascend_max_memory_usage_bytes_from_groups(vllm_config, target) + sum(
+            spec.max_memory_usage_bytes(vllm_config)
+            for group in draft
+            for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -612,7 +665,32 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
-    if is_deepseek_v41_cache(kv_cache_groups):
+    target, draft = _split_mmuse_cache_groups(kv_cache_groups)
+    if draft:
+        target_bytes = _ascend_pool_bytes_per_block(target)
+        num_blocks = may_override_num_blocks(vllm_config, available_memory // (target_bytes + _mmuse_page_bytes(draft)))
+        kv_cache_config = _ascend_get_kv_cache_config_from_groups(vllm_config, target, num_blocks * target_bytes)
+        assert kv_cache_config.num_blocks == num_blocks
+        offset = target_bytes * num_blocks
+        tensors = list(kv_cache_config.kv_cache_tensors)
+        for group in draft:
+            for name, spec in group.kv_cache_spec.kv_cache_specs.items():
+                layer_size = num_blocks * spec.page_size_bytes
+                tensors.append(
+                    KVCacheTensor(
+                        size=0,
+                        layers=[name],
+                        offset=offset,
+                        layer_stride=layer_size,
+                        block_stride=spec.page_size_bytes,
+                    )
+                )
+                offset += layer_size
+        # Ascend's DSV4 worker materializes all descriptors in one allocation.
+        # Give Draft disjoint trailing regions, preserving every Target offset.
+        kv_cache_config.kv_cache_tensors = [replace(tensor, size=offset) for tensor in tensors]
+        kv_cache_config.kv_cache_groups = kv_cache_groups
+    elif is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         kv_cache_config = get_glm5_next_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
