@@ -101,9 +101,10 @@ def test_framework_binding_registers_cache_owners_without_target_quantizer(monke
         module.bind_framework_attention(model, config, 7)
 
 
+@pytest.mark.parametrize("storage", ["stacked", "tuple", "page_interleaved"])
 @pytest.mark.parametrize("device", ["cpu", "npu"])
 @torch.inference_mode()
-def test_framework_pages_follow_absolute_positions_and_reallocated_tables(monkeypatch, device):
+def test_framework_pages_follow_absolute_positions_and_reallocated_tables(monkeypatch, device, storage):
     if device == "npu":
         pytest.importorskip("torch_npu")
         if not torch.npu.is_available():
@@ -116,11 +117,19 @@ def test_framework_pages_follow_absolute_positions_and_reallocated_tables(monkey
         num_kv_heads=2,
         head_size=64,
     )
-    arena = attention_module().FrameworkContextAttention(
-        owner, torch.empty(1, 256, 128, dtype=owner.kv_cache.dtype, device=device), 7
-    )
+    dtype = owner.kv_cache.dtype
+    if storage == "tuple":
+        owner.kv_cache = tuple(owner.kv_cache.unbind(0))
+    elif storage == "page_interleaved":
+        # MRV2 exposes separate K/V views of the shared per-page allocation.
+        backing = owner.kv_cache.transpose(0, 1).contiguous()
+        owner.kv_cache = tuple(backing.unbind(1))
+        assert not owner.kv_cache[0].is_contiguous()
+    arena = attention_module().FrameworkContextAttention(owner, torch.empty(1, 256, 128, dtype=dtype, device=device), 7)
     arena.prepare_for_capture()
-    q = torch.randn(7, 4, 64, dtype=owner.kv_cache.dtype, device=device)
+    assert torch.count_nonzero(arena.key_cache[0]) == 0
+    assert torch.count_nonzero(arena.value_cache[0]) == 0
+    q = torch.randn(7, 4, 64, dtype=dtype, device=device)
     qk = torch.randn(7, 2, 64, dtype=q.dtype, device=device)
     qv = torch.randn_like(qk)
     for first, end, pages in [
@@ -207,8 +216,9 @@ def install_paged_oracle(monkeypatch):
     def write(key, value, key_cache, value_cache, slots):
         writes.append(slots.clone())
         valid = slots >= 0
-        key_cache.flatten(0, 1).index_copy_(0, slots[valid].long(), key[valid])
-        value_cache.flatten(0, 1).index_copy_(0, slots[valid].long(), value[valid])
+        selected = slots[valid].long()
+        key_cache[selected // key_cache.shape[1], selected % key_cache.shape[1]] = key[valid]
+        value_cache[selected // value_cache.shape[1], selected % value_cache.shape[1]] = value[valid]
 
     device.DeviceOperator = NS(reshape_and_cache=write)
     monkeypatch.setitem(sys.modules, device.__name__, device)
@@ -591,3 +601,18 @@ def test_deepseek_mixed_mmuse_cache_groups_cover_layers_and_budget_shared_backin
     result = scope["_ascend_get_kv_cache_config_from_groups"](config, groups, 1600)
     assert result.num_blocks == 3
     assert {t.size for t in result.kv_cache_tensors} == {3 * divisor}
+
+
+@pytest.mark.parametrize("invalid", ["single", "shape", "dtype", "scalar"])
+def test_framework_cache_validation_rejects_malformed_pairs(invalid):
+    key = torch.zeros(2, 128, 2, 64, dtype=torch.bfloat16)
+    cache = {
+        "single": (key,),
+        "shape": (key, key[:, :, :1]),
+        "dtype": (key, key.float()),
+        "scalar": torch.tensor(0),
+    }[invalid]
+    owner = NS(kv_cache=cache, num_kv_heads=2, head_size=64)
+    arena = attention_module().FrameworkContextAttention(owner, torch.empty(1, 256, 128), 7)
+    with pytest.raises(ValueError, match="MMuse framework FIA"):
+        arena.prepare_for_capture()

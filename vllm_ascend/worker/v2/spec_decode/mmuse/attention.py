@@ -191,11 +191,25 @@ class FrameworkContextAttention(nn.Module):
 
     def _validate_cache(self):
         cache = self.cache_owner.kv_cache
+        if isinstance(cache, torch.Tensor) and cache.ndim != 5:
+            raise ValueError("MMuse framework FIA requires stacked 5D K/V or separate 4D views")
+        if not isinstance(cache, (tuple, list, torch.Tensor)) or len(cache) != 2:
+            raise ValueError("MMuse framework FIA requires a K/V pair")
+        key, value = cache
         expected = (self.page_size, self.cache_owner.num_kv_heads, self.cache_owner.head_size)
-        if cache.ndim != 5 or cache.shape[0] != 2 or tuple(cache.shape[2:]) != expected:
-            raise ValueError("MMuse framework FIA requires standard [2, blocks, tokens, heads, dim] KV layout")
-        if cache.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("MMuse framework FIA requires unquantized FP16/BF16 KV")
+        if (
+            not isinstance(key, torch.Tensor)
+            or not isinstance(value, torch.Tensor)
+            or key.ndim != 4
+            or tuple(key.shape[1:]) != expected
+            or key.shape != value.shape
+            or key.shape[0] == 0
+        ):
+            raise ValueError("MMuse framework FIA requires [blocks, tokens, heads, dim] K/V views")
+        if key.dtype not in (torch.float16, torch.bfloat16) or value.dtype != key.dtype:
+            raise ValueError("MMuse framework FIA requires matching unquantized FP16/BF16 K/V")
+        if key.device != value.device or key.device != self.bounds.device:
+            raise ValueError("MMuse framework FIA K/V must be on the Draft device")
 
     def reset_request(self):
         self._mode = "profile"
@@ -211,7 +225,8 @@ class FrameworkContextAttention(nn.Module):
         self.block_table.zero_()
         self.query_slots.fill_(-1)
         # Block zero is the framework's reserved null block, never a live page.
-        self.cache_owner.kv_cache[:, 0].zero_()
+        self.key_cache[0].zero_()
+        self.value_cache[0].zero_()
 
     def begin_request(self, table, start, end):
         self._validate_cache()
