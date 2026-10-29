@@ -11,12 +11,29 @@ class AscendMMuseReferenceSpeculator(MMuseReferenceSpeculator):
         )
         if backend == "reference":
             return
-        if backend != "ascend_fia":
-            raise ValueError("MMuse attention backend must be reference or ascend_fia")
-        from vllm_ascend.worker.v2.spec_decode.mmuse.attention import fused_context_attention
+        if backend not in ("ascend_fia", "ascend_paged_fia", "ascend_framework_fia"):
+            raise ValueError(
+                "MMuse attention backend must be reference, ascend_fia, ascend_paged_fia or ascend_framework_fia"
+            )
+        from vllm_ascend.worker.v2.spec_decode.mmuse.attention import (
+            PagedContextAttention,
+            fused_context_attention,
+        )
 
         for layer in model.layers:
-            layer.self_attn.attention_impl = fused_context_attention
+            if backend == "ascend_fia":
+                layer.self_attn.attention_impl = fused_context_attention
+            elif backend == "ascend_paged_fia":
+                layer.self_attn.paged_attention_impl = PagedContextAttention(
+                    model.feature_storage,
+                    layer.self_attn.kv_heads,
+                    layer.self_attn.dim,
+                    self.num_query_per_req,
+                )
+        if backend == "ascend_framework_fia":
+            from vllm_ascend.worker.v2.spec_decode.mmuse.attention import bind_framework_attention
+
+            bind_framework_attention(model, self.vllm_config, self.num_query_per_req)
 
     def get_target_rotation(self):
         from pathlib import Path

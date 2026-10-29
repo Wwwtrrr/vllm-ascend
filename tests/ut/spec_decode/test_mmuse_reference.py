@@ -30,7 +30,7 @@ def test_mmuse_kv_option_is_not_forwarded_to_ascend_config():
     assert additional_config["mmuse_draft_kv_reuse"] is True
 
 
-@pytest.mark.parametrize("backend", ["reference", "ascend_fia", "unknown"])
+@pytest.mark.parametrize("backend", ["reference", "ascend_fia", "ascend_paged_fia", "ascend_framework_fia", "unknown"])
 def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, backend):
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/mmuse/reference.py"
     cls = next(node for node in ast.parse(path.read_text()).body if isinstance(node, ast.ClassDef))
@@ -38,11 +38,16 @@ def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, back
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
     module = ModuleType("vllm_ascend.worker.v2.spec_decode.mmuse.attention")
     module.fused_context_attention = object()
+    page_backend = object()
+    module.PagedContextAttention = lambda *args: page_backend
+    framework_calls = []
+    module.bind_framework_attention = lambda *args: framework_calls.append(args)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     proposer = namespace[cls.name]()
+    proposer.num_query_per_req = 3
     proposer.vllm_config = NS(additional_config={"mmuse_attention_backend": backend})
-    attention = NS(attention_impl=None)
-    model = NS(layers=[NS(self_attn=attention)])
+    attention = NS(attention_impl=None, paged_attention_impl=None, kv_heads=2, dim=64)
+    model = NS(layers=[NS(self_attn=attention)], feature_storage=torch.zeros(1, 16, 128))
     if backend == "unknown":
         with pytest.raises(ValueError, match="backend"):
             proposer.configure_attention(model)
@@ -50,6 +55,8 @@ def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, back
         proposer.configure_attention(model)
         expected = module.fused_context_attention if backend == "ascend_fia" else None
         assert attention.attention_impl is expected
+        assert attention.paged_attention_impl is (page_backend if backend == "ascend_paged_fia" else None)
+        assert len(framework_calls) == (1 if backend == "ascend_framework_fia" else 0)
 
 
 def test_reference_proposer_uses_ascend_sampler(monkeypatch):

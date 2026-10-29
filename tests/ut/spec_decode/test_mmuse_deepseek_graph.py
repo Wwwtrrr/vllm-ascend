@@ -4,6 +4,7 @@
 import ast
 import importlib.util
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
@@ -45,12 +46,345 @@ def test_native_graph_adapter_keeps_quarot_and_npu_sampling_bindings():
         scope[cls.name](config, "npu")
 
 
-def attention_bridge():
+def attention_module():
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/mmuse/attention.py"
     spec = importlib.util.spec_from_file_location("mmuse_fia_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.fused_context_attention
+    return module
+
+
+def attention_bridge():
+    return attention_module().fused_context_attention
+
+
+def test_framework_binding_registers_cache_owners_without_target_quantizer(monkeypatch):
+    module = attention_module()
+    config = NS(
+        kv_transfer_config=None, cache_config=NS(cache_dtype="fp8", sliding_window=32, calculate_kv_scales=True)
+    )
+    registered = {}
+    config_module = ModuleType("vllm.config")
+    config_module.set_current_vllm_config = lambda cfg: nullcontext(cfg)
+    owners = ModuleType("vllm.model_executor.layers.attention")
+
+    class Owner(torch.nn.Module):
+        def __init__(self, heads, dim, scale, **kwargs):
+            super().__init__()
+            self.layer_name = kwargs["prefix"]
+            self.num_kv_heads, self.head_size = kwargs["num_kv_heads"], dim
+            self.kv_cache = torch.empty(0)
+            assert kwargs["quant_config"] is None
+            assert kwargs["cache_config"].cache_dtype == "auto"
+            assert kwargs["cache_config"].sliding_window is None
+            assert not kwargs["cache_config"].calculate_kv_scales
+            registered[self.layer_name] = self
+
+    owners.Attention = Owner
+    backend_module = ModuleType("vllm_ascend.attention.attention_v1")
+    backend_module.AscendAttentionBackend = object()
+    for item in (config_module, owners, backend_module):
+        monkeypatch.setitem(sys.modules, item.__name__, item)
+    layers = [NS(self_attn=NS(heads=4, kv_heads=2, dim=64, paged_attention_impl=None)) for _ in range(2)]
+    model = NS(layers=layers, feature_storage=torch.empty(1, 256, 128, dtype=torch.bfloat16))
+    module.bind_framework_attention(model, config, 7)
+    assert len(registered) == 2
+    for index, layer in enumerate(layers):
+        paged = layer.self_attn.paged_attention_impl
+        assert paged.cache_owner is registered[f"draft_model.layers.{index}.self_attn.attn"]
+        assert "key_cache" not in paged._buffers  # No private K/V arena.
+    assert config.cache_config.cache_dtype == "fp8"
+    assert config.cache_config.sliding_window == 32
+    config.kv_transfer_config = object()
+    with pytest.raises(ValueError, match="KV transfer"):
+        module.bind_framework_attention(model, config, 7)
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@torch.inference_mode()
+def test_framework_pages_follow_absolute_positions_and_reallocated_tables(monkeypatch, device):
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("NPU required")
+    else:
+        install_paged_oracle(monkeypatch)
+    torch.manual_seed(121)
+    owner = NS(
+        kv_cache=torch.full((2, 9, 128, 2, 64), float("nan"), dtype=torch.bfloat16, device=device),
+        num_kv_heads=2,
+        head_size=64,
+    )
+    arena = attention_module().FrameworkContextAttention(
+        owner, torch.empty(1, 256, 128, dtype=owner.kv_cache.dtype, device=device), 7
+    )
+    arena.prepare_for_capture()
+    q = torch.randn(7, 4, 64, dtype=owner.kv_cache.dtype, device=device)
+    qk = torch.randn(7, 2, 64, dtype=q.dtype, device=device)
+    qv = torch.randn_like(qk)
+    for first, end, pages in [
+        (0, 125, [3, 1]),
+        (0, 132, [3, 1]),
+        (125, 257, [4, 6, 2]),
+        (129, 260, [4, 6, 2]),
+        (0, 4, [6]),
+        (0, 125, [1, 3]),
+    ]:
+        table = torch.zeros(8, dtype=torch.int32, device=device)
+        table[: len(pages)] = table.new_tensor(pages)
+        arena.begin_request(table, first, end)
+        length = end - first
+        key = torch.randn(256, 2, 64, dtype=q.dtype, device=device)
+        value = torch.randn_like(key)
+        key[length:] = value[length:] = float("nan")
+        arena.prepare_context(key, value, start=min(3, length))
+        visible = torch.ones(7, 263, dtype=torch.bool, device=device)
+        visible[:, :2] = False
+        visible[:, length:256] = False
+        visible[:, 256:] = torch.ones(7, 7, dtype=torch.bool, device=device).tril()
+        compact_mask = torch.cat((visible[:, :length], visible[:, 256:]), -1)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            torch.cat((key[:length], qk)).transpose(0, 1)[None].repeat_interleave(2, 1),
+            torch.cat((value[:length], qv)).transpose(0, 1)[None].repeat_interleave(2, 1),
+            attn_mask=compact_mask,
+        )[0].transpose(0, 1)
+        actual = arena(q, qk, qv, visible)
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+    # Capture uses reserved block zero and inert writes; actual replay changes
+    # table, span and context on stable tensor addresses, not graph arguments.
+    if device == "npu":
+        arena.prepare_for_capture()
+        for _ in range(3):
+            arena(q, qk, qv, visible)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            output = arena(q, qk, qv, visible)
+        arena.begin_request(table, first, end)
+        arena.prepare_context(key, value)
+        expected = arena(q, qk, qv, visible)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, expected, atol=0.03, rtol=0.03)
+
+
+@torch.inference_mode()
+def test_framework_short_allocation_falls_back_without_page_writes(monkeypatch):
+    writes = install_paged_oracle(monkeypatch)
+    module = attention_module()
+    owner = NS(kv_cache=torch.zeros(2, 4, 128, 2, 64, dtype=torch.bfloat16), num_kv_heads=2, head_size=64)
+    arena = module.FrameworkContextAttention(owner, torch.empty(1, 256, 128), 7)
+    arena.begin_request(torch.tensor([2], dtype=torch.int32), 0, 125)
+    assert arena.requires_eager
+    assert not writes
+    context = torch.randn(125, 2, 64)
+    query = torch.randn(7, 4, 64)
+    key, value = torch.randn(7, 2, 64), torch.randn(7, 2, 64)
+    visible = torch.ones(7, 132, dtype=torch.bool)
+    seen = []
+
+    def dense(q, k, v, mask):
+        seen.append((k.shape, v.shape, mask))
+        return q
+
+    monkeypatch.setattr(module, "fused_context_attention", dense)
+    arena.prepare_context(context, context)
+    torch.testing.assert_close(arena(query, key, value, visible), query)
+    assert seen[0][:2] == (torch.Size([132, 2, 64]), torch.Size([132, 2, 64]))
+    assert not writes
+    assert arena._profile_context is None
+    arena.begin_request(torch.tensor([2, 3], dtype=torch.int32), 0, 125)
+    assert not arena.requires_eager
+
+
+def install_paged_oracle(monkeypatch):
+    """Emulate native page writes and PA reads; no device-kernel claim."""
+    device = ModuleType("vllm_ascend.device.device_op")
+    writes = []
+
+    def write(key, value, key_cache, value_cache, slots):
+        writes.append(slots.clone())
+        valid = slots >= 0
+        key_cache.flatten(0, 1).index_copy_(0, slots[valid].long(), key[valid])
+        value_cache.flatten(0, 1).index_copy_(0, slots[valid].long(), value[valid])
+
+    device.DeviceOperator = NS(reshape_and_cache=write)
+    monkeypatch.setitem(sys.modules, device.__name__, device)
+    npu = ModuleType("torch_npu")
+
+    def fia(**kwargs):
+        table = kwargs["block_table"][0].long()
+        length = kwargs["actual_seq_lengths_kv"][0]
+        heads = kwargs["num_key_value_heads"]
+        dim = kwargs["query"].shape[-1]
+        keys = kwargs["key"][table].reshape(-1, heads, dim)[:length]
+        values = kwargs["value"][table].reshape(-1, heads, dim)[:length]
+        groups = kwargs["num_heads"] // heads
+        return torch.nn.functional.scaled_dot_product_attention(
+            kwargs["query"],
+            keys.transpose(0, 1)[None].repeat_interleave(groups, 1),
+            values.transpose(0, 1)[None].repeat_interleave(groups, 1),
+            attn_mask=~kwargs["atten_mask"],
+        ), None
+
+    npu.npu_fused_infer_attention_score = fia
+    monkeypatch.setitem(sys.modules, npu.__name__, npu)
+    return writes
+
+
+@torch.inference_mode()
+def test_paged_decoder_and_rollout_match_reference_through_rejection_and_reuse(monkeypatch):
+    path = Path(__file__).resolve().parents[4] / "vllm/tests/v1/spec_decode/test_mmuse_deepseek_graph.py"
+    spec = importlib.util.spec_from_file_location("mmuse_paged_decoder_test", path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    torch.manual_seed(101)
+    owner = helper.model("cpu", torch.bfloat16, (4, None), monkeypatch)
+    install_paged_oracle(monkeypatch)
+    paged_cls = attention_module().PagedContextAttention
+    pages = [paged_cls(owner.feature_storage, 2, 4, 3) for _ in owner.layers]
+    graph_cls = helper.pure_module("deepseek_graph").DeepseekMMuseGraphs
+    args = (owner, 3, None, None, torch.zeros(2), torch.zeros(2, dtype=torch.long), False, None)
+    driver, reference = graph_cls(*args), graph_cls(*args)
+    features = torch.randn(30, 16, dtype=torch.bfloat16)
+    rounds = [
+        (0, "a", 0, 5, 0),
+        (0, "a", 0, 12, 5),
+        (0, "a", 2, 18, 12),
+        (0, "a", 2, 18, 14),
+        (0, "a", 2, 8, 8),
+        (1, "b", 0, 3, 0),
+        (0, "new", 0, 6, 0),
+    ]
+    for slot, request, start, end, update in rounds:
+        features[update:end] += 0.1
+        positions, context = torch.arange(start, end), features[start:end]
+        anchor = torch.tensor([7])
+        for layer in owner.layers:
+            layer.self_attn.paged_attention_impl = None
+        size = reference.prepare(positions, context, anchor, slot)
+        reference.forward(size)
+        expected_tokens = reference.output.clone()
+        model_args = (
+            reference.input_ids,
+            reference.positions,
+            reference.context_positions[:size],
+            reference.context[:size],
+            tuple(kv[:, :size] for kv in reference.context_kv),
+            reference.anchor_index,
+        )
+        expected_hidden = owner.forward_fixed_context(*model_args)
+        _, expected_logits = owner.runtime.rollout_correction(expected_hidden[None], anchor)
+        # Exercise eager loading/profile fallback as well as prepared graph context.
+        expected_eager = owner(anchor.new_tensor([7, 31, 31]), torch.arange(end, end + 3), positions, context)
+        for layer, page in zip(owner.layers, pages):
+            layer.self_attn.paged_attention_impl = page
+        actual_eager = owner(anchor.new_tensor([7, 31, 31]), torch.arange(end, end + 3), positions, context)
+        torch.testing.assert_close(actual_eager, expected_eager, atol=0.03, rtol=0.03)
+        # Eager/profile calls reuse the arena, so simulate graph lifecycle reset.
+        driver.context_entry = None
+        size = driver.prepare(
+            positions, context, anchor, slot, request_id=request, start=start, end=end, update_start=update
+        )
+        args = (
+            driver.input_ids,
+            driver.positions,
+            driver.context_positions[:size],
+            driver.context[:size],
+            tuple(kv[:, :size] for kv in driver.context_kv),
+            driver.anchor_index,
+        )
+        actual_hidden = owner.forward_fixed_context(*args)
+        actual_tokens, actual_logits = owner.runtime.rollout_correction(actual_hidden[None], anchor)
+        torch.testing.assert_close(actual_hidden, expected_hidden, atol=0.03, rtol=0.03)
+        torch.testing.assert_close(actual_logits, expected_logits, atol=0.03, rtol=0.03)
+        torch.testing.assert_close(actual_tokens[0], expected_tokens)
+    # Consecutive FULL steps reuse pages. Window shift must rewrite the retained
+    # prefix because its logical page offsets have changed.
+    for start, end, update in [(0, 9, 0), (0, 12, 9), (2, 18, 12), (2, 18, 14)]:
+        features[update:end] += 0.1
+        size = driver.prepare(
+            torch.arange(start, end),
+            features[start:end],
+            anchor,
+            0,
+            request_id="continuous",
+            start=start,
+            end=end,
+            update_start=update,
+        )
+        args = (
+            driver.input_ids,
+            driver.positions,
+            driver.context_positions[:size],
+            driver.context[:size],
+            tuple(kv[:, :size] for kv in driver.context_kv),
+            driver.anchor_index,
+        )
+        actual = owner.forward_fixed_context(*args)
+        for layer in owner.layers:
+            layer.self_attn.paged_attention_impl = None
+        expected = owner.forward_fixed_context(*args)
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+        for layer, page in zip(owner.layers, pages):
+            layer.self_attn.paged_attention_impl = page
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@torch.inference_mode()
+def test_paged_cache_handles_page_crossing_overwrite_and_shorter_context(monkeypatch, device):
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("NPU required")
+        writes = None
+    else:
+        writes = install_paged_oracle(monkeypatch)
+    torch.manual_seed(89)
+    arena = attention_module().PagedContextAttention(
+        torch.zeros(1, 256, 128, dtype=torch.bfloat16, device=device), 2, 64, 7
+    )
+    # A nonidentity page table ensures tests exercise block mapping, not a
+    # coincidentally contiguous flatten of physical storage.
+    arena.block_table.copy_(arena.block_table.flip(-1))
+    logical = torch.arange(arena.slots.numel(), device=device)
+    arena.slots.copy_(arena.block_table[0, logical // 128].long() * 128 + logical % 128)
+    k = torch.randn(263, 2, 64, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    q = torch.randn(7, 4, 64, dtype=k.dtype, device=device)
+    for length, start in [(125, 0), (132, 125), (132, 120), (4, 0), (256, 0)]:
+        k[start:length] += 0.1
+        arena.prepare_context(k[:length], v[:length], start=start)
+        visible = torch.ones(7, length + 7, dtype=torch.bool, device=device)
+        visible[:, : max(0, length - 100)] = False
+        visible[:, length:] = torch.ones(7, 7, dtype=torch.bool, device=device).tril()
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            k[: length + 7].transpose(0, 1)[None].repeat_interleave(2, 1),
+            v[: length + 7].transpose(0, 1)[None].repeat_interleave(2, 1),
+            attn_mask=visible,
+        )[0].transpose(0, 1)
+        actual = arena(q, k[length : length + 7], v[length : length + 7], visible)
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+        if writes is not None:
+            assert writes[-2].numel() == length - start
+            assert writes[-1].numel() == 7
+    assert not arena.state_dict()  # Runtime pages must not enter checkpoints.
+    if device == "npu":
+        graph = torch.npu.NPUGraph()
+        for _ in range(3):
+            arena(q, k[256:], v[256:], visible)
+        torch.npu.synchronize()
+        with torch.npu.graph(graph):
+            output = arena(q, k[256:], v[256:], visible)
+        q.add_(0.1)
+        k[:256] += 0.2
+        arena.prepare_context(k[:256], v[:256])
+        expected = arena(q, k[256:], v[256:], visible)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, expected, atol=0.03, rtol=0.03)
 
 
 @pytest.mark.parametrize("query_heads,kv_heads", [(4, 2), (2, 2)])
