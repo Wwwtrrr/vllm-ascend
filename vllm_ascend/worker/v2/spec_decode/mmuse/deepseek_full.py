@@ -15,6 +15,7 @@ class AscendDeepseekMMuseFullSpeculator(DeepseekMMuseFullSpeculator):
 
     get_target_rotation = AscendMMuseReferenceSpeculator.get_target_rotation
     sample = AscendMMuseReferenceSpeculator.sample
+    configure_attention = AscendMMuseReferenceSpeculator.configure_attention
 
     def graph_backend(self):
         return torch.npu

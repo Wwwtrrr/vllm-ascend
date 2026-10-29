@@ -1839,6 +1839,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # Consumed by the upstream MMuse proposer, not by AscendConfig.
         # Preserve it in vllm_config.additional_config for worker construction.
         "mmuse_draft_kv_reuse",
+        "mmuse_attention_backend",
         # control-flow flag (singleton/cache refresh), not a configuration field
         "refresh",
         # Upstream-injected by EngineArgs for the generic GDN/KDA prefill

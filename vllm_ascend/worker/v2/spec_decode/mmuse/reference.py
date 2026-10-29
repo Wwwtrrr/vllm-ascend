@@ -5,6 +5,19 @@ from vllm.v1.worker.gpu.spec_decode.mmuse.reference import MMuseReferenceSpecula
 
 
 class AscendMMuseReferenceSpeculator(MMuseReferenceSpeculator):
+    def configure_attention(self, model):
+        backend = (getattr(self.vllm_config, "additional_config", None) or {}).get(
+            "mmuse_attention_backend", "reference"
+        )
+        if backend == "reference":
+            return
+        if backend != "ascend_fia":
+            raise ValueError("MMuse attention backend must be reference or ascend_fia")
+        from vllm_ascend.worker.v2.spec_decode.mmuse.attention import fused_context_attention
+
+        for layer in model.layers:
+            layer.self_attn.attention_impl = fused_context_attention
+
     def get_target_rotation(self):
         from pathlib import Path
 
@@ -19,8 +32,7 @@ class AscendMMuseReferenceSpeculator(MMuseReferenceSpeculator):
         path = declared if declared.is_file() else root / "optional" / declared.name
         if not path.is_file():
             raise ValueError(
-                f"MMuse Target declares QuaRot but its matrix is missing: "
-                f"{declared} (also checked {path})"
+                f"MMuse Target declares QuaRot but its matrix is missing: {declared} (also checked {path})"
             )
         return get_rotation_matrix(path)
 

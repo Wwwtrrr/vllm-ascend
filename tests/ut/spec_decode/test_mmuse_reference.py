@@ -24,10 +24,32 @@ def test_mmuse_kv_option_is_not_forwarded_to_ascend_config():
         and any(isinstance(target, ast.Name) and target.id == "_NON_USER_INPUT_KEYS" for target in node.targets)
     )
     keys = eval(compile(ast.Expression(excluded), str(path), "eval"), {"_RUNTIME_CONFIG_STRIP_KEYS": set()})
-    additional_config = {"mmuse_draft_kv_reuse": True, "enable_fused_mc2": 0}
+    additional_config = {"mmuse_draft_kv_reuse": True, "mmuse_attention_backend": "ascend_fia", "enable_fused_mc2": 0}
     forwarded = {key: value for key, value in additional_config.items() if key not in keys}
     assert forwarded == {"enable_fused_mc2": 0}
     assert additional_config["mmuse_draft_kv_reuse"] is True
+
+
+@pytest.mark.parametrize("backend", ["reference", "ascend_fia", "unknown"])
+def test_attention_binding_is_explicit_and_preserves_reference(monkeypatch, backend):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/worker/v2/spec_decode/mmuse/reference.py"
+    cls = next(node for node in ast.parse(path.read_text()).body if isinstance(node, ast.ClassDef))
+    namespace = {"MMuseReferenceSpeculator": object}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
+    module = ModuleType("vllm_ascend.worker.v2.spec_decode.mmuse.attention")
+    module.fused_context_attention = object()
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    proposer = namespace[cls.name]()
+    proposer.vllm_config = NS(additional_config={"mmuse_attention_backend": backend})
+    attention = NS(attention_impl=None)
+    model = NS(layers=[NS(self_attn=attention)])
+    if backend == "unknown":
+        with pytest.raises(ValueError, match="backend"):
+            proposer.configure_attention(model)
+    else:
+        proposer.configure_attention(model)
+        expected = module.fused_context_attention if backend == "ascend_fia" else None
+        assert attention.attention_impl is expected
 
 
 def test_reference_proposer_uses_ascend_sampler(monkeypatch):
