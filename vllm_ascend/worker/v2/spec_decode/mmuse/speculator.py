@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend DFlash execution with shared reference MMuse heads and rollout."""
+"""Legacy Ascend DFlash-based MMuse entry point, outside the worker factory."""
 
 from vllm.model_executor.models.mmuse_runtime import (
     MMuseGreedyRolloutMixin,
