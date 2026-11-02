@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import torch
+
 
 def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     config_module = ModuleType("vllm.config")
@@ -22,6 +24,10 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
 
     upstream.LEagleSpeculator = LEagleSpeculator
     monkeypatch.setitem(sys.modules, upstream_name, upstream)
+    graph_name = "vllm.v1.worker.gpu.spec_decode.leagle.graph"
+    graph_module = ModuleType(graph_name)
+    graph_module.NativeLEagleGraphBackend = lambda api, device, cls: (api, device, cls)
+    monkeypatch.setitem(sys.modules, graph_name, graph_module)
     root = Path(__file__).resolve().parents[2]
     name = "vllm_ascend.worker.v2.spec_decode.leagle"
     spec = importlib.util.spec_from_file_location(name, root / "vllm_ascend/worker/v2/spec_decode/leagle.py")
@@ -39,3 +45,6 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     assert type(proposer) is adapter.AscendLEagleSpeculator
     assert isinstance(proposer, LEagleSpeculator)
     assert proposer.device == "npu:0"
+    npu = SimpleNamespace(NPUGraph=object)
+    monkeypatch.setattr(torch, "npu", npu, raising=False)
+    assert proposer.create_graph_backend() == (npu, "npu:0", object)
