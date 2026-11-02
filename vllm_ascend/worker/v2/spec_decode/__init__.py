@@ -31,6 +31,10 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.method == "leagle":
+        from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+
+        return AscendLEagleSpeculator(vllm_config, device)
     if speculative_config.enforce_eager:
         vllm_config = copy.copy(vllm_config)
         vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)
