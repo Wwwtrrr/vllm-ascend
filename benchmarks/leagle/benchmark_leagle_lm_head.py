@@ -67,6 +67,66 @@ def capture(torch, forward, device):
     return graph, output, stream, pool
 
 
+def benchmark_fused(torch, hidden, weight, args, block_vocab, block_k):
+    import torch.nn.functional as F
+    from leagle_lm_head_triton import FusedLMHeadPrototype, validate_edge_cases
+
+    original_hidden = hidden.clone()
+    try:
+        # Every configuration sees the same validation inputs.
+        torch.manual_seed(args.seed + 1)
+        validate_edge_cases(hidden.device, block_vocab, block_k)
+        fused = FusedLMHeadPrototype(weight, args.batch_size, block_vocab, block_k)
+        mismatches = 0
+        for case in range(args.correctness_cases + 1):
+            if case == 0:
+                hidden.zero_()
+            else:
+                hidden.normal_()
+            expected = F.linear(hidden, weight).argmax(-1)
+            mismatches += int((fused(hidden) != expected).sum().item())
+        if mismatches:
+            raise ValueError(f"Token mismatches: {mismatches}; configuration rejected")
+        hidden.copy_(original_hidden)
+
+        def forward():
+            for _ in range(args.steps):
+                output = fused(hidden)
+            return output
+
+        eager = measure(torch, forward, args.warmup, args.repeats, args.trials, args.steps)
+        captured = capture(torch, forward, hidden.device)
+        graph, output, _, _ = captured
+        # Changed-input replay catches accidental capture-time specialization.
+        hidden.normal_()
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output, F.linear(hidden, weight).argmax(-1))
+        hidden.copy_(original_hidden)
+        graphed = measure(torch, graph.replay, args.warmup, args.repeats, args.trials, args.steps)
+        torch.npu.synchronize()
+        return {
+            "status": "passed",
+            "block_vocab": block_vocab,
+            "block_k": block_k,
+            "token_mismatches": 0,
+            "validation_cases": args.correctness_cases + 1,
+            "edge_cases_and_changed_input_replay": "passed",
+            "eager": eager,
+            "graph": graphed,
+        }
+    finally:
+        hidden.copy_(original_hidden)
+        # A device execution failure must stop the sweep, not be treated as a
+        # recoverable compiler error in a potentially poisoned device context.
+        torch.npu.synchronize()
+
+
+def save_report(report, output):
+    if output:
+        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -82,6 +142,11 @@ def main():
     parser.add_argument("--repeats", type=positive_int, default=100)
     parser.add_argument("--trials", type=positive_int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sweep-fused",
+        action="store_true",
+        help="Sweep vocab tiles 8/16/32 and hidden tiles 128/256",
+    )
     parser.add_argument(
         "--try-fused",
         action="store_true",
@@ -158,58 +223,63 @@ def main():
                 )
             torch.npu.synchronize()
             del output, graph, stream, pool, captured, reference
-        if args.try_fused:
-            from leagle_lm_head_triton import FusedLMHeadPrototype, validate_edge_cases
-
-            validate_edge_cases(device, args.fused_block_vocab, args.fused_block_k)
-            print("FUSED EDGE CASES: tail masks, cross-tile ties, batch=2, NaN, hierarchical reduction passed")
-
-            fused = FusedLMHeadPrototype(weight, args.batch_size, args.fused_block_vocab, args.fused_block_k)
-            # Compare token IDs, including all-equal logits and mutated inputs.
-            original_hidden = hidden.clone()
-            mismatches = 0
-            for case in range(args.correctness_cases + 1):
-                if case == 0:
-                    hidden.zero_()
+        if args.try_fused or args.sweep_fused:
+            configurations = (
+                [(v, k) for v in (8, 16, 32) for k in (128, 256)]
+                if args.sweep_fused
+                else [(args.fused_block_vocab, args.fused_block_k)]
+            )
+            report["fused_configs"] = []
+            save_report(report, args.output)
+            baseline = report["results"]["linear_argmax_graph"]["device_interval_ms_per_step_median"]
+            for block_vocab, block_k in configurations:
+                print(f"TRY FUSED vocab={block_vocab} k={block_k}", flush=True)
+                try:
+                    result = benchmark_fused(torch, hidden, weight, args, block_vocab, block_k)
+                except Exception as error:  # noqa: BLE001 -- record failed sweep cases
+                    # Re-raise asynchronous device failures instead of trying
+                    # subsequent kernels on an unhealthy context.
+                    torch.npu.synchronize()
+                    result = {
+                        "status": "failed",
+                        "block_vocab": block_vocab,
+                        "block_k": block_k,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                    print(f"FAILED vocab={block_vocab} k={block_k}: {error}", flush=True)
                 else:
-                    hidden.normal_()
-                expected = F.linear(hidden, weight).argmax(-1)
-                actual = fused(hidden)
-                mismatches += int((actual != expected).sum().item())
-            hidden.copy_(original_hidden)
-            report["fused_validation"] = {
-                "block_vocab": args.fused_block_vocab,
-                "block_k": args.fused_block_k,
-                "cases": args.correctness_cases + 1,
-                "token_mismatches": mismatches,
-                "note": "Finite random inputs plus zero input; not a model-quality evaluation",
-            }
-            print("FUSED VALIDATION:", report["fused_validation"])
-            if mismatches:
-                raise RuntimeError("Fused token mismatch: reject this configuration; no speed claim")
-
-            def fused_forward():
-                for _ in range(args.steps):
-                    output = fused(hidden)
-                return output
-
-            eager = measure(torch, fused_forward, args.warmup, args.repeats, args.trials, args.steps)
-            captured = capture(torch, fused_forward, device)
-            graph, output, stream, pool = captured
-            # Verify replay reads changed inputs rather than capture-time values.
-            hidden.normal_()
-            graph.replay()
-            torch.npu.synchronize()
-            torch.testing.assert_close(output, F.linear(hidden, weight).argmax(-1))
-            hidden.copy_(original_hidden)
-            graphed = measure(torch, graph.replay, args.warmup, args.repeats, args.trials, args.steps)
-            for mode, result in (("eager", eager), ("graph", graphed)):
-                report["results"][f"fused_{mode}"] = result
-                ms = result["device_interval_ms_per_step_median"]
-                baseline = report["results"][f"linear_argmax_{mode}"]["device_interval_ms_per_step_median"]
-                print(f"fused          {mode:5s}: {ms:.6f} ms/step; speedup vs linear_argmax {baseline / ms:.3f}x")
-            torch.npu.synchronize()
-            del output, graph, stream, pool, captured
+                    for mode in ("eager", "graph"):
+                        ms = result[mode]["device_interval_ms_per_step_median"]
+                        native = report["results"][f"linear_argmax_{mode}"]["device_interval_ms_per_step_median"]
+                        result[mode]["speedup_vs_native"] = native / ms
+                        print(
+                            f"fused v={block_vocab} k={block_k} {mode}: {ms:.6f} ms/step; speedup {native / ms:.3f}x",
+                            flush=True,
+                        )
+                report["fused_configs"].append(result)
+                save_report(report, args.output)
+            ranked = sorted(
+                (r for r in report["fused_configs"] if r["status"] == "passed"),
+                key=lambda r: r["graph"]["device_interval_ms_per_step_median"],
+            )
+            print(f"GRAPH RANKING (native Linear+ArgMax: {baseline:.6f} ms/step)")
+            report["fused_graph_ranking"] = []
+            for rank, result in enumerate(ranked, 1):
+                ms = result["graph"]["device_interval_ms_per_step_median"]
+                row = {
+                    "rank": rank,
+                    "block_vocab": result["block_vocab"],
+                    "block_k": result["block_k"],
+                    "ms_per_step": ms,
+                    "speedup": baseline / ms,
+                }
+                report["fused_graph_ranking"].append(row)
+                print(f"{rank}. vocab={row['block_vocab']} k={row['block_k']}: {ms:.6f} ms/step, {baseline / ms:.3f}x")
+            if not ranked:
+                print("No configuration passed; no fused performance result is valid.")
+            elif ranked[0]["graph"]["device_interval_ms_per_step_median"] >= baseline:
+                print("No fused configuration beats the native baseline; keep the native path.")
         print("Weight bytes / interval is an estimate, not measured HBM bandwidth.")
         if args.output:
             args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
