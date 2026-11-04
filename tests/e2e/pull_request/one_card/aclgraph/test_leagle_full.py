@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real NPU capture/replay and target-only/eager/FULL serving equivalence."""
 
+import copy
 import json
 import os
 import subprocess
@@ -19,11 +20,19 @@ if not torch.npu.is_available():
     pytest.skip("LEAGLE FULL requires an NPU", allow_module_level=True)
 
 from vllm.model_executor.models.qwen3_leagle import LEagleDraftModel
+from vllm.v1.worker.gpu.spec_decode.leagle.context import LEagleContext
+from vllm.v1.worker.gpu.spec_decode.leagle.execution import (
+    LEagleExecution,
+    LEagleExecutionOptions,
+    LEagleOptimizedGraphRunner,
+)
 from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
     LEagleGraphInputs,
     LEagleGraphRunner,
     NativeLEagleGraphBackend,
 )
+
+from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
 
 
 def _draft(config):
@@ -82,6 +91,39 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
         actual = manager.propose(context[None], anchor, 3)
         torch.testing.assert_close(actual, expected)
     assert manager.proposal_replays == manager.projection_replays == 4
+
+
+@torch.inference_mode()
+def test_native_optimized_batch_cache_and_fused_norm_match_reference():
+    torch.manual_seed(42)
+    model = _draft(_architecture()).to(device="npu", dtype=torch.bfloat16)
+    reference = copy.deepcopy(model)
+    adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
+    model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
+    context = LEagleContext(3, 16, 32, dtype=torch.bfloat16, device="npu")
+    execution = LEagleExecution(model, context, 16, 3, LEagleExecutionOptions(), dtype=torch.bfloat16, device="npu")
+    manager = LEagleOptimizedGraphRunner(
+        execution, NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    )
+    manager.capture()
+    anchors = torch.tensor([[3], [5], [7]], device="npu")
+    history = {}
+    for rows in ([(2, 0, 4), (0, 0, 2)], [(0, 2, 3), (2, 4, 2)]):
+        inputs = [torch.randn(count, 96, device="npu", dtype=torch.bfloat16) for _, _, count in rows]
+        positions = torch.cat([torch.arange(start, start + count, device="npu") for _, start, count in rows])
+        execution.project(torch.cat(inputs), positions, manager)
+        begin = 0
+        for (slot, start, count), features in zip(rows, inputs):
+            execution.update(slot, str(slot), start, begin, begin + count)
+            history[slot] = features if start == 0 else torch.cat((history[slot][:start], features))
+            begin += count
+        result = torch.full((2, 3), -1, dtype=torch.long, device="npu")
+        execution.propose([(row, slot) for row, (slot, _, _) in enumerate(rows)], anchors, result, 3, manager)
+        for row, (slot, _, _) in enumerate(rows):
+            prefix = reference.project_context(history[slot][None])
+            expected = reference.propose_context(prefix, anchors[slot : slot + 1], 3)
+            torch.testing.assert_close(result[row : row + 1], expected)
+    assert manager.proposal_replays == manager.projection_replays == 2
 
 
 def _count_target_replays(worker):

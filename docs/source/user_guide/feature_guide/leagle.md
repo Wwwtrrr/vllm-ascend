@@ -36,13 +36,33 @@ buckets. Each replay reads the current device context length; stale rejected
 features and padding are masked, and draft KV starts fresh. Runtime-resizing
 RoPE variants are rejected for draft FULL. There is no paged FIA integration.
 
-FULL adds a padded single-request context buffer, feature projection buffers and
+FULL adds padded batch workspaces, feature projection buffers and
 graph memory. These inputs are allocated before memory profiling. Profiling
 graphs are released and recaptured through the framework's graph-manager
-lifecycle. Requests are drafted sequentially, each using one K-token rollout
-replay. Verdict/position copies and request staging remain outside graphs and
-still synchronize once per batch. No graph or speedup claim is established by
+lifecycle. Requests are drafted in batch/context buckets, each batch using one
+K-token rollout replay. Verdict/position copies and request staging remain
+outside graphs and still synchronize once per batch. No graph or speedup claim is established by
 the CPU tests alone.
+
+The optimized executor enables these `speculative_config` options by default:
+`leagle_reuse_context_kv`, `leagle_static_draft_kv`, `leagle_batch_drafts`,
+`leagle_fused_projections` and `leagle_fused_rmsnorm`. The last option dispatches
+to native NPU RMSNorm. Packed Q/K/V and gate/up projections retain the original
+checkpoint names and require no retraining. Set all five options to `false` for
+the reference path when measuring acceptance, TPOT and profiling differences.
+
+New verified target features are projected into persistent per-request K/V by
+the projection graph; subsequent rounds reuse that prefix. Rejections, rewinds
+and request-slot reuse update the valid prefix rather than promoting synthetic
+draft states. The rollout graph batches requests, copies context into reusable
+attention workspaces once per round and updates short logical-layer draft KV
+in place. Seven draft tokens still require seven autoregressive steps.
+
+Persistent K/V, packed weights, batched workspaces and graph buckets consume
+additional memory. Start with small request/length limits and check available
+memory before increasing them. Cached K/V requires fixed runtime RoPE scaling.
+These changes do not add paged FIA attention. Training chunked loss and DDP
+remain training-repository settings, not vLLM/Ascend serving options.
 
 Run output-parity and acceptance evaluations on an NPU with the actual trained
 checkpoint before measuring serving performance. The CPU factory test is:

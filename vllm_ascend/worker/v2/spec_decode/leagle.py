@@ -13,3 +13,10 @@ class AscendLEagleSpeculator(LEagleSpeculator):
 
     def create_graph_backend(self):
         return NativeLEagleGraphBackend(torch.npu, self.device, torch.npu.NPUGraph)
+
+    def create_rmsnorm_impl(self):
+        def rms_norm(hidden, weight, epsilon):
+            flattened = hidden.reshape(-1, hidden.shape[-1]).contiguous()
+            return torch.ops.npu.npu_rms_norm(flattened, weight, epsilon)[0].view_as(hidden)
+
+        return rms_norm
