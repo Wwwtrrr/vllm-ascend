@@ -44,6 +44,16 @@ K-token rollout replay. Verdict/position copies and request staging remain
 outside graphs and still synchronize once per batch. No graph or speedup claim is established by
 the CPU tests alone.
 
+In the optimized FULL path, projection graphs write their outputs into
+persistent feature/KV buffers. Separate native ACL cache-update graphs scatter
+verified suffixes into request slots, including partial prefills without draft
+proposals. Capture and padded writes target a private sink slot, protecting
+live prefixes. The rollout graph gathers anchors by device slot indices;
+slot/length metadata is staged together. Host request validation, grouping,
+input copies and verdict synchronization remain outside graphs. Each nonempty
+request suffix adds a cache-update replay, so measure its latency on the NPU.
+The sink slot and additional graph buckets also consume device memory.
+
 The optimized executor enables these `speculative_config` options by default:
 `leagle_reuse_context_kv`, `leagle_static_draft_kv`, `leagle_batch_drafts`,
 `leagle_fused_projections` and `leagle_fused_rmsnorm`. The last option dispatches

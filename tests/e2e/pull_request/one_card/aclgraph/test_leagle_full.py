@@ -114,7 +114,7 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference():
         execution.project(torch.cat(inputs), positions, manager)
         begin = 0
         for (slot, start, count), features in zip(rows, inputs):
-            execution.update(slot, str(slot), start, begin, begin + count)
+            execution.update(slot, str(slot), start, begin, begin + count, manager)
             history[slot] = features if start == 0 else torch.cat((history[slot][:start], features))
             begin += count
         result = torch.full((2, 3), -1, dtype=torch.long, device="npu")
@@ -124,6 +124,7 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference():
             expected = reference.propose_context(prefix, anchors[slot : slot + 1], 3)
             torch.testing.assert_close(result[row : row + 1], expected)
     assert manager.proposal_replays == manager.projection_replays == 2
+    assert manager.update_replays == 4
 
 
 def _count_target_replays(worker):
@@ -146,6 +147,7 @@ def _graph_stats(worker):
         target=runner.cudagraph_manager.leagle_test_replays,
         draft=draft.proposal_replays,
         projection=draft.projection_replays,
+        cache_update=draft.update_replays,
     )
 
 
