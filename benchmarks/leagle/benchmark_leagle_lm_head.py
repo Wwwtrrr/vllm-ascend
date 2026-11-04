@@ -67,7 +67,17 @@ def capture(torch, forward, device):
     return graph, output, stream, pool
 
 
-def benchmark_fused(torch, hidden, weight, args, block_vocab, block_k):
+def benchmark_fused(
+    torch,
+    hidden,
+    weight,
+    args,
+    block_vocab,
+    block_k,
+    *,
+    backend="vector",
+    projection_only=False,
+):
     import torch.nn.functional as F
     from leagle_lm_head_triton import FusedLMHeadPrototype, validate_edge_cases
 
@@ -75,16 +85,33 @@ def benchmark_fused(torch, hidden, weight, args, block_vocab, block_k):
     try:
         # Every configuration sees the same validation inputs.
         torch.manual_seed(args.seed + 1)
-        validate_edge_cases(hidden.device, block_vocab, block_k)
-        fused = FusedLMHeadPrototype(weight, args.batch_size, block_vocab, block_k)
+        validate_edge_cases(
+            hidden.device,
+            block_vocab,
+            block_k,
+            backend=backend,
+            projection_only=projection_only,
+        )
+        fused = FusedLMHeadPrototype(
+            weight,
+            args.batch_size,
+            block_vocab,
+            block_k,
+            backend=backend,
+            projection_only=projection_only,
+        )
         mismatches = 0
         for case in range(args.correctness_cases + 1):
             if case == 0:
                 hidden.zero_()
             else:
                 hidden.normal_()
-            expected = F.linear(hidden, weight).argmax(-1)
-            mismatches += int((fused(hidden) != expected).sum().item())
+            expected_logits = F.linear(hidden, weight)
+            actual = fused(hidden)
+            if projection_only:
+                torch.testing.assert_close(actual, expected_logits, rtol=0.02, atol=0.02)
+                actual = actual.argmax(-1)
+            mismatches += int((actual != expected_logits.argmax(-1)).sum().item())
         if mismatches:
             raise ValueError(f"Token mismatches: {mismatches}; configuration rejected")
         hidden.copy_(original_hidden)
@@ -101,12 +128,19 @@ def benchmark_fused(torch, hidden, weight, args, block_vocab, block_k):
         hidden.normal_()
         graph.replay()
         torch.npu.synchronize()
-        torch.testing.assert_close(output, F.linear(hidden, weight).argmax(-1))
+        expected_logits = F.linear(hidden, weight)
+        if projection_only:
+            torch.testing.assert_close(output, expected_logits, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(output.argmax(-1), expected_logits.argmax(-1))
+        else:
+            torch.testing.assert_close(output, expected_logits.argmax(-1))
         hidden.copy_(original_hidden)
         graphed = measure(torch, graph.replay, args.warmup, args.repeats, args.trials, args.steps)
         torch.npu.synchronize()
         return {
             "status": "passed",
+            "backend": backend,
+            "projection_only": projection_only,
             "block_vocab": block_vocab,
             "block_k": block_k,
             "token_mismatches": 0,
@@ -142,6 +176,19 @@ def main():
     parser.add_argument("--repeats", type=positive_int, default=100)
     parser.add_argument("--trials", type=positive_int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--try-dot", action="store_true", help="Test BF16 tl.dot prototype")
+    parser.add_argument(
+        "--sweep-dot",
+        action="store_true",
+        help="Sweep dot tiles: vocab 64/128, K 64/128",
+    )
+    parser.add_argument(
+        "--dot-projection-only",
+        action="store_true",
+        help="Compare dot logits with native Linear, without argmax",
+    )
+    parser.add_argument("--dot-block-vocab", type=positive_int, default=64)
+    parser.add_argument("--dot-block-k", type=positive_int, default=128)
     parser.add_argument(
         "--sweep-fused",
         action="store_true",
@@ -157,6 +204,10 @@ def main():
     parser.add_argument("--correctness-cases", type=positive_int, default=8)
     parser.add_argument("--output", type=Path, help="Optional JSON results file")
     args = parser.parse_args()
+    if (args.try_dot or args.sweep_dot) and (args.try_fused or args.sweep_fused):
+        parser.error("Choose either dot or vector experiments in one run")
+    if args.dot_projection_only and not (args.try_dot or args.sweep_dot):
+        parser.error("--dot-projection-only requires --try-dot or --sweep-dot")
 
     import torch
     import torch.nn.functional as F
@@ -223,19 +274,42 @@ def main():
                 )
             torch.npu.synchronize()
             del output, graph, stream, pool, captured, reference
-        if args.try_fused or args.sweep_fused:
+        if args.try_fused or args.sweep_fused or args.try_dot or args.sweep_dot:
+            backend = "dot" if args.try_dot or args.sweep_dot else "vector"
+            projection_only = args.dot_projection_only
+            baseline_label = "linear" if projection_only else "linear_argmax"
             configurations = (
                 [(v, k) for v in (8, 16, 32) for k in (128, 256)]
                 if args.sweep_fused
                 else [(args.fused_block_vocab, args.fused_block_k)]
             )
+            if backend == "dot":
+                configurations = (
+                    [(v, k) for v in (64, 128) for k in (64, 128)]
+                    if args.sweep_dot
+                    else [(args.dot_block_vocab, args.dot_block_k)]
+                )
+            report["prototype_backend"] = backend
+            report["projection_only"] = projection_only
             report["fused_configs"] = []
             save_report(report, args.output)
-            baseline = report["results"]["linear_argmax_graph"]["device_interval_ms_per_step_median"]
+            baseline = report["results"][f"{baseline_label}_graph"]["device_interval_ms_per_step_median"]
             for block_vocab, block_k in configurations:
-                print(f"TRY FUSED vocab={block_vocab} k={block_k}", flush=True)
+                print(
+                    f"TRY {backend.upper()} projection_only={projection_only} vocab={block_vocab} k={block_k}",
+                    flush=True,
+                )
                 try:
-                    result = benchmark_fused(torch, hidden, weight, args, block_vocab, block_k)
+                    result = benchmark_fused(
+                        torch,
+                        hidden,
+                        weight,
+                        args,
+                        block_vocab,
+                        block_k,
+                        backend=backend,
+                        projection_only=projection_only,
+                    )
                 except Exception as error:  # noqa: BLE001 -- record failed sweep cases
                     # Re-raise asynchronous device failures instead of trying
                     # subsequent kernels on an unhealthy context.
@@ -251,7 +325,7 @@ def main():
                 else:
                     for mode in ("eager", "graph"):
                         ms = result[mode]["device_interval_ms_per_step_median"]
-                        native = report["results"][f"linear_argmax_{mode}"]["device_interval_ms_per_step_median"]
+                        native = report["results"][f"{baseline_label}_{mode}"]["device_interval_ms_per_step_median"]
                         result[mode]["speedup_vs_native"] = native / ms
                         print(
                             f"fused v={block_vocab} k={block_k} {mode}: {ms:.6f} ms/step; speedup {native / ms:.3f}x",
@@ -263,7 +337,7 @@ def main():
                 (r for r in report["fused_configs"] if r["status"] == "passed"),
                 key=lambda r: r["graph"]["device_interval_ms_per_step_median"],
             )
-            print(f"GRAPH RANKING (native Linear+ArgMax: {baseline:.6f} ms/step)")
+            print(f"GRAPH RANKING (native {baseline_label}: {baseline:.6f} ms/step)")
             report["fused_graph_ranking"] = []
             for rank, result in enumerate(ranked, 1):
                 ms = result["graph"]["device_interval_ms_per_step_median"]

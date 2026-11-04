@@ -1,6 +1,6 @@
-"""Experimental Ascend Triton GEMV + greedy selection, without full logits.
+"""Experimental Ascend Triton vector/dot LM-head implementations.
 
-This is a vector-reduction prototype, not a tuned Cube matmul replacement.
+Dot mode uses BF16 tl.dot with padded 16-row tiles; vector mode uses reductions.
 FP32 reduction order can differ from native matmul. Benchmark and validate
 before considering serving integration. Requires the Ascend Triton backend.
 """
@@ -8,6 +8,62 @@ before considering serving integration. Requires the Ascend Triton backend.
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _dot_project(
+    X,
+    W,
+    Logits,
+    Scores,
+    Ids,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    PARTS: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    FUSED: tl.constexpr,
+):
+    part = tl.program_id(0)
+    rows = tl.program_id(1) * BM + tl.arange(0, BM)
+    vocab = part * BN + tl.arange(0, BN)
+    offsets = tl.arange(0, BK)
+    accum = tl.zeros((BM, BN), tl.float32)
+    for base in range(tl.cdiv(H, BK)):
+        cols = base * BK + offsets
+        x = tl.load(
+            X + rows[:, None] * H + cols[None, :],
+            (rows[:, None] < B) & (cols[None, :] < H),
+            other=0,
+        )
+        w = tl.load(
+            W + vocab[None, :] * H + cols[:, None],
+            (vocab[None, :] < V) & (cols[:, None] < H),
+            other=0,
+        )
+        accum = tl.dot(x, w, accum)
+    rounded = accum.to(tl.bfloat16)
+    if FUSED:
+        scores = rounded.to(tl.float32)
+        nan = (scores != scores) & (vocab[None, :] < V)  # noqa: PLR0124
+        has_nan = tl.sum(nan.to(tl.int32), axis=1) > 0
+        maximum = tl.max(tl.where((vocab[None, :] < V) & ~nan, scores, -float("inf")), axis=1)
+        winner = tl.where(has_nan[:, None], nan, (vocab[None, :] < V) & (scores == maximum[:, None]))
+        index = tl.min(tl.where(winner, vocab[None, :], 2147483647), axis=1)
+        tl.store(
+            Scores + rows * PARTS + part,
+            tl.where(has_nan, float("nan"), maximum),
+            rows < B,
+        )
+        tl.store(Ids + rows * PARTS + part, index, rows < B)
+    else:
+        tl.store(
+            Logits + rows[:, None] * V + vocab[None, :],
+            rounded,
+            (rows[:, None] < B) & (vocab[None, :] < V),
+        )
 
 
 @triton.jit
@@ -75,13 +131,29 @@ def _reduce_max(
 class FusedLMHeadPrototype:
     """Preallocated buffers permit capture after eager compilation/warmup."""
 
-    def __init__(self, weight, batch_size=1, block_vocab=16, block_k=256):
+    def __init__(
+        self,
+        weight,
+        batch_size=1,
+        block_vocab=16,
+        block_k=256,
+        *,
+        backend="vector",
+        projection_only=False,
+    ):
         if weight.device.type != "npu" or weight.dtype != torch.bfloat16:
             raise ValueError("Prototype requires NPU BF16 weights")
         if weight.ndim != 2 or not weight.is_contiguous():
             raise ValueError("Expected contiguous [vocab, hidden] weights")
         if any(value < 1 or value & (value - 1) for value in (block_vocab, block_k)):
             raise ValueError("Tile dimensions must be positive powers of two")
+        if backend not in ("vector", "dot"):
+            raise ValueError("Unknown projection backend")
+        if backend == "dot" and min(block_vocab, block_k) < 16:
+            raise ValueError("Dot tiles must be at least 16")
+        if projection_only and backend != "dot":
+            raise ValueError("Projection-only mode requires dot backend")
+        self.backend, self.projection_only = backend, projection_only
         self.weight = weight
         self.batch = batch_size
         self.vocab, self.hidden = weight.shape
@@ -90,6 +162,11 @@ class FusedLMHeadPrototype:
         self.scores = torch.empty(batch_size, self.parts, device=weight.device, dtype=torch.float32)
         self.ids = torch.empty(batch_size, self.parts, device=weight.device, dtype=torch.int32)
         self.output = torch.empty(batch_size, 1, device=weight.device, dtype=torch.long)
+        self.logits = (
+            torch.empty(batch_size, 1, self.vocab, device=weight.device, dtype=weight.dtype)
+            if projection_only
+            else None
+        )
         # Bound each reduction's live vectors independently of vocabulary size.
         # 9496 candidates become 19, then 1, rather than a 16384-wide UB tile.
         self.reduce_block = 512
@@ -116,18 +193,26 @@ class FusedLMHeadPrototype:
             or not hidden.is_contiguous()
         ):
             raise ValueError("Expected contiguous BF16 [batch, 1, hidden] input")
-        _project_local_max[(self.parts, self.batch)](
-            hidden,
-            self.weight,
-            self.scores,
-            self.ids,
-            self.hidden,
-            self.vocab,
-            self.parts,
-            self.bv,
-            self.bk,
-            enable_fp_fusion=False,
-        )
+        if self.backend == "dot":
+            _dot_project[(self.parts, triton.cdiv(self.batch, 16))](
+                hidden,
+                self.weight,
+                self.logits if self.projection_only else self.scores,
+                self.scores,
+                self.ids,
+                self.batch,
+                self.hidden,
+                self.vocab,
+                self.parts,
+                16,
+                self.bv,
+                self.bk,
+                not self.projection_only,
+            )
+            if self.projection_only:
+                return self.logits
+        else:
+            self._project_vector(hidden)
         for scores, ids, out_scores, out_ids, parts, out_parts in self.reductions:
             _reduce_max[(out_parts, self.batch)](
                 scores,
@@ -140,10 +225,33 @@ class FusedLMHeadPrototype:
             )
         return self.output
 
+    def _project_vector(self, hidden):
+        _project_local_max[(self.parts, self.batch)](
+            hidden,
+            self.weight,
+            self.scores,
+            self.ids,
+            self.hidden,
+            self.vocab,
+            self.parts,
+            self.bv,
+            self.bk,
+            enable_fp_fusion=False,
+        )
+
 
 @torch.inference_mode()
-def validate_edge_cases(device, block_vocab, block_k):
+def validate_edge_cases(device, block_vocab, block_k, *, backend="vector", projection_only=False):
     """Exercise tail masks, cross-tile ties, batches and NaN selection on NPU."""
+
+    def check(kernel, hidden, weight):
+        expected = torch.nn.functional.linear(hidden, weight)
+        actual = kernel(hidden)
+        if projection_only:
+            torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02, equal_nan=True)
+            actual = actual.argmax(-1)
+        torch.testing.assert_close(actual, expected.argmax(-1))
+
     vocab, width = max(block_vocab, 2) + 5, block_k + 3
     weight = torch.zeros(vocab, width, device=device, dtype=torch.bfloat16)
     hidden = torch.zeros(2, 1, width, device=device, dtype=torch.bfloat16)
@@ -153,24 +261,48 @@ def validate_edge_cases(device, block_vocab, block_k):
     weight[-1, 1] = 3
     hidden[0, 0, 0] = 1
     hidden[1, 0, 1] = 1
-    kernel = FusedLMHeadPrototype(weight, 2, block_vocab, block_k)
+    kernel = FusedLMHeadPrototype(
+        weight,
+        2,
+        block_vocab,
+        block_k,
+        backend=backend,
+        projection_only=projection_only,
+    )
     for case in range(3):
         if case == 1:
             hidden.zero_()
         elif case == 2:
             weight[-1, 0] = float("nan")
-        expected = torch.nn.functional.linear(hidden, weight).argmax(-1)
-        torch.testing.assert_close(kernel(hidden), expected)
+        check(kernel, hidden, weight)
 
     # More than 512 local candidates forces multiple reduction levels.
     weight = torch.zeros(block_vocab * 513 + 3, 17, device=device, dtype=torch.bfloat16)
     hidden = torch.ones(1, 1, 17, device=device, dtype=torch.bfloat16)
     weight[-1, 0] = 3
-    kernel = FusedLMHeadPrototype(weight, 1, block_vocab, block_k)
+    kernel = FusedLMHeadPrototype(
+        weight,
+        1,
+        block_vocab,
+        block_k,
+        backend=backend,
+        projection_only=projection_only,
+    )
     for case in range(3):
         if case == 1:
             weight[0, 0] = 3  # Global tie across reduction groups: choose ID zero.
         elif case == 2:
             weight[-1, 1] = float("nan")
-        expected = torch.nn.functional.linear(hidden, weight).argmax(-1)
-        torch.testing.assert_close(kernel(hidden), expected)
+        check(kernel, hidden, weight)
+    if backend == "dot":
+        weight = torch.randn(block_vocab + 3, block_k + 1, device=device, dtype=torch.bfloat16)
+        hidden = torch.randn(17, 1, block_k + 1, device=device, dtype=torch.bfloat16)
+        kernel = FusedLMHeadPrototype(
+            weight,
+            17,
+            block_vocab,
+            block_k,
+            backend=backend,
+            projection_only=projection_only,
+        )
+        check(kernel, hidden, weight)
