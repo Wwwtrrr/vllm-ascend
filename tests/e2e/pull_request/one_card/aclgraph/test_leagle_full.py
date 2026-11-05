@@ -94,9 +94,13 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
 
 
 @torch.inference_mode()
-def test_native_optimized_batch_cache_and_fused_norm_match_reference():
+@pytest.mark.parametrize("candidate", [False, True])
+def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     torch.manual_seed(42)
-    model = _draft(_architecture()).to(device="npu", dtype=torch.bfloat16)
+    config = _architecture()
+    if candidate:
+        config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
+    model = _draft(config).to(device="npu", dtype=torch.bfloat16)
     reference = copy.deepcopy(model)
     adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
     model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
@@ -184,9 +188,12 @@ def _serve(mode, target, draft, output_path):
 
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
-def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode):
+@pytest.mark.parametrize("candidate", [False, True])
+def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate):
     torch.manual_seed(42)
     config = _architecture()
+    if candidate:
+        config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
     target_config = Qwen3Config(**config["transformer_layer_config"])
     target_config.num_hidden_layers = 4
     target_config.layer_types = ["full_attention"] * 4
@@ -230,6 +237,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode):
                 str(output),
             ],
             check=True,
+            env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
             timeout=300,
         )
         results.append(json.loads(output.read_text(encoding="utf-8")))

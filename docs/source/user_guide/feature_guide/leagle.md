@@ -19,6 +19,22 @@ controls decoder layers, shared loops, auxiliary target features, attention and
 vocabulary mapping. A matching verifier is required. No extra architecture flags
 or checkpoint conversion are needed.
 
+Trained candidate-head checkpoints (`candidate_head=true`) are supported through
+the shared LEAGLE model in eager and native FULL ACL graphs. Low-rank retrieval
+selects Top-K rows of the original LM head, followed by exact candidate scoring
+and greedy selection without full-vocabulary logits. The checkpoint's rank and
+Top-K are preserved, including the two trained candidate projection weights.
+Dense checkpoints continue using the original dense head. Missing or non-finite
+candidate weights fail loading rather than falling back to random retrieval.
+
+For dense A/B evaluation of a candidate checkpoint, set
+`leagle_use_candidate_head=false` in `speculative_config`. To adjust retrieval
+width, use `leagle_candidate_top_k` with the candidate path enabled. These
+settings take effect before capture. Greedy proposal verification remains the
+framework's one-hot rejection path. Candidate retrieval can miss the dense best
+token; measure acceptance and TPOT on the real checkpoint. Hardware tests cover
+candidate eager/FULL output parity and replay counters but must be run on NPU.
+
 This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.
