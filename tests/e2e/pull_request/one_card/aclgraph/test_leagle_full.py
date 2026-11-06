@@ -94,13 +94,15 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("candidate", [False, True])
+@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank"])
 def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     torch.manual_seed(42)
     config = _architecture()
-    if candidate:
+    if candidate is True:
         config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
     model = _draft(config).to(device="npu", dtype=torch.bfloat16)
+    if candidate in ("svd", "svd_lowrank"):
+        model.configure_output_head(svd_rank=8, top_k=7 if candidate == "svd" else None, rerank=candidate == "svd")
     reference = copy.deepcopy(model)
     adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
     model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
@@ -155,7 +157,7 @@ def _graph_stats(worker):
     )
 
 
-def _serve(mode, target, draft, output_path):
+def _serve(mode, target, draft, output_path, svd="none"):
     # Worker subprocesses import the serving stack after selecting V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
@@ -173,6 +175,10 @@ def _serve(mode, target, draft, output_path):
     )
     if draft != "none":
         kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
+        if svd != "none":
+            kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
+            if svd == "svd":
+                kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
     if mode != "eager":
         kwargs["compilation_config"] = dict(cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16])
     llm = LLM(**kwargs)
@@ -188,11 +194,11 @@ def _serve(mode, target, draft, output_path):
 
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
-@pytest.mark.parametrize("candidate", [False, True])
+@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank"])
 def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate):
     torch.manual_seed(42)
     config = _architecture()
-    if candidate:
+    if candidate is True:
         config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
     target_config = Qwen3Config(**config["transformer_layer_config"])
     target_config.num_hidden_layers = 4
@@ -235,6 +241,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 str(target_path),
                 run_draft,
                 str(output),
+                candidate if candidate in ("svd", "svd_lowrank") else "none",
             ],
             check=True,
             env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},

@@ -35,6 +35,27 @@ framework's one-hot rejection path. Candidate retrieval can miss the dense best
 token; measure acceptance and TPOT on the real checkpoint. Hardware tests cover
 candidate eager/FULL output parity and replay counters but must be run on NPU.
 
+Dense checkpoints also support inference-only SVD initialization. Set
+`leagle_candidate_svd_rank=256` and `leagle_candidate_top_k=256` in the
+speculative config. No trained candidate weights or checkpoint edits are
+required: loaded LM-head weights generate CPU FP64 Gram/eigh factors, matching
+the training repository's SVD method. Factor buffers are nonpersistent and
+allocated on the model device before profiling and ACL capture. Replay only
+executes low-rank retrieval, Top-K and original-weight candidate rescoring.
+
+For direct low-rank logits without rescoring, set
+`leagle_candidate_rerank=false` and omit `leagle_candidate_top_k`. For dense
+comparison, remove `leagle_candidate_svd_rank` and set
+`leagle_use_candidate_head=false`. Restart between modes; do not hot-reload
+weights into an initialized SVD head. Both candidate and direct low-rank modes
+can change draft tokens and acceptance. Real NPU correctness and performance
+must be measured; CPU tests do not establish ACL or latency behavior.
+
+SVD does not require NPU FP64/eigh support. CPU decomposition can take time,
+with initialization start/end logs. The original dense head stays resident;
+factors add device memory and are recomputed at every startup, not cached on
+disk or added to saved checkpoints.
+
 This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.
