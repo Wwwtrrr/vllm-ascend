@@ -56,6 +56,36 @@ with initialization start/end logs. The original dense head stays resident;
 factors add device memory and are recomputed at every startup, not cached on
 disk or added to saved checkpoints.
 
+## Target input preparation graphs
+
+`leagle_target_input_graphs` defaults to `true` for Ascend LEAGLE FULL decode.
+A separate native ACL preparation graph captures request-map expansion,
+position/sequence-length preparation, sampled/draft token combination, block
+table gathering and slot-mapping calculation. The target model then replays
+its existing FULL graph. These are separate graph executions, not one combined
+end-to-end engine graph.
+
+Host request maps, logits boundaries, FIA query boundaries, prefill lengths and
+block counts are packed into one fixed-address upload. In particular, rotating
+UVA prefill/block-count buffers are not captured directly. Each real request
+count has a startup capture, sharing a private preparation pool. Outputs retain
+the existing target input/block-table addresses, including padding. Profiling
+captures are discarded and rebuilt through the speculator manager lifecycle;
+serving never captures a new shape lazily.
+
+This fast path requires FULL decode, one KV-cache group, real request slots,
+one bonus token per request, no PCP and no adaptive verification. Prefill,
+mixed batches, additional FIA padding rows beyond capacity and unsupported
+layouts use normal preparation. Set `leagle_target_input_graphs=false` for a
+same-workload A/B test. Restart the engine after changing this setting.
+
+The operations still appear in device profiling, now under preparation graph
+replay. Their occurrence counts need not decrease: this change reduces host
+submissions and consolidates metadata uploads. Scheduler work, staged block
+table writes, rejection/CPU length synchronization, and external input copies
+remain outside the graph. Measure end-to-end TPOT with profiling disabled as
+well as graph replay counters; hardware speedup is not established by CPU tests.
+
 This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.

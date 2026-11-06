@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
 )
 
 from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.leagle_inputs import LEagleTargetInputGraphRunner, LEagleTargetInputState
 
 
 def _draft(config):
@@ -133,6 +134,96 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     assert manager.update_replays == 4
 
 
+@torch.inference_mode()
+def test_native_target_input_graph_matches_eager_with_slot_reorder_and_padding():
+    from vllm.v1.worker.gpu.input_batch import (
+        combine_sampled_and_draft_tokens,
+        expand_idx_mapping,
+        prepare_pos_seq_lens,
+    )
+
+    buffers = SimpleNamespace(
+        input_ids=torch.full((16,), -1, device="npu", dtype=torch.long),
+        positions=torch.zeros(16, device="npu", dtype=torch.long),
+        seq_lens=torch.zeros(3, device="npu", dtype=torch.int32),
+        query_start_loc=torch.zeros(5, device="npu", dtype=torch.int32),
+    )
+    requests = SimpleNamespace(
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([8, 12, 5], device="npu", dtype=torch.int32)),
+        prefill_len=SimpleNamespace(gpu=torch.tensor([2, 3, 1], device="npu", dtype=torch.int32), np=[2, 3, 1]),
+        last_sampled_tokens=torch.tensor([5, 7, 9], device="npu"),
+        draft_tokens=torch.arange(6, device="npu").view(3, 2),
+    )
+    state = LEagleTargetInputState(buffers, requests, 3, 3)
+    from vllm_ascend.worker.v2.block_table import AscendBlockTables
+
+    blocks = AscendBlockTables([4], 3, 16, [8], torch.device("npu:0"), kernel_block_sizes=[4])
+    blocks.block_tables[0].gpu.copy_(torch.arange(24, device="npu", dtype=torch.int32).view(3, 8))
+    blocks.num_blocks.np.fill(8)
+    blocks.num_blocks.copy_to_uva()
+    state.block_tables = blocks
+    manager = LEagleTargetInputGraphRunner(
+        state, NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    )
+    manager.capture()
+    for slots, cu, query in (
+        ([2, 0], [0, 3, 4], [0, 3, 4, 8, 4]),
+        ([0, 2], [0, 2, 5], [0, 2, 5, 8, 5]),
+        ([1], [0, 1], [0, 1, 1, 1, 1]),
+    ):
+        # Advance device-side state between replays, including the one-token
+        # no-draft case and changing request counts without new captures.
+        requests.num_computed_tokens.gpu.add_(1)
+        blocks.num_blocks.np[0, 0] = 7
+        blocks.num_blocks.copy_to_uva()
+        state.stage(slots, cu, query)
+        n, total = len(slots), cu[-1]
+        buffers.input_ids.fill_(-1)
+        buffers.query_start_loc.copy_(state.query)
+        expected = expand_idx_mapping(state.idx[:n], total, state.cu[: n + 1], 3)
+        prepare_pos_seq_lens(
+            state.idx[:n],
+            buffers.query_start_loc,
+            requests.num_computed_tokens.gpu,
+            buffers.positions,
+            buffers.seq_lens,
+        )
+        logits = combine_sampled_and_draft_tokens(
+            buffers.input_ids,
+            state.idx[:n],
+            requests.last_sampled_tokens,
+            buffers.query_start_loc,
+            buffers.seq_lens,
+            requests.prefill_len.gpu,
+            requests.draft_tokens,
+            state.cu[: n + 1],
+            total,
+            1,
+        )
+        expected = tuple(t.clone() for t in (*expected, logits))
+        expected_tables = tuple(t.clone() for t in blocks.gather_block_tables(state.idx[:n], 3))
+        expected_mappings = blocks.compute_slot_mappings(
+            state.idx[:n], buffers.query_start_loc, buffers.positions, 16
+        ).clone()
+        expected_ids, expected_pos, expected_seq = (
+            buffers.input_ids[:total].clone(),
+            buffers.positions[:total].clone(),
+            buffers.seq_lens.clone(),
+        )
+        buffers.input_ids.fill_(-1)
+        actual = manager.replay(n, total)
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference)
+        torch.testing.assert_close(buffers.input_ids[:total], expected_ids)
+        torch.testing.assert_close(buffers.positions[:total], expected_pos)
+        torch.testing.assert_close(buffers.seq_lens, expected_seq)
+        actual_tables, actual_mappings = manager.prepared_attn
+        for value, reference in zip(actual_tables, expected_tables):
+            torch.testing.assert_close(value, reference)
+        torch.testing.assert_close(actual_mappings, expected_mappings)
+    assert manager.replays == 3
+
+
 def _count_target_replays(worker):
     manager = worker.model_runner.cudagraph_manager
     assert manager.graphs, "Target FULL graph capture was skipped"
@@ -154,10 +245,11 @@ def _graph_stats(worker):
         draft=draft.proposal_replays,
         projection=draft.projection_replays,
         cache_update=draft.update_replays,
+        input_prep=getattr(getattr(runner.speculator, "target_input_graph_runner", None), "replays", 0),
     )
 
 
-def _serve(mode, target, draft, output_path, svd="none"):
+def _serve(mode, target, draft, output_path, svd="none", input_graphs="on"):
     # Worker subprocesses import the serving stack after selecting V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
@@ -175,6 +267,7 @@ def _serve(mode, target, draft, output_path, svd="none"):
     )
     if draft != "none":
         kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
+        kwargs["speculative_config"]["leagle_target_input_graphs"] = input_graphs == "on"
         if svd != "none":
             kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
             if svd == "svd":
@@ -225,11 +318,12 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
     )
     (draft_path / "config.json").write_text(json.dumps(checkpoint), encoding="utf-8")
     results = []
-    for index, (run_mode, run_draft) in enumerate(
+    for index, (run_mode, run_draft, input_graphs) in enumerate(
         (
-            ("eager", "none"),
-            ("eager", str(draft_path)),
-            (mode, str(draft_path)),
+            ("eager", "none", "on"),
+            ("eager", str(draft_path), "on"),
+            (mode, str(draft_path), "on"),
+            (mode, str(draft_path), "off"),
         )
     ):
         output = tmp_path / f"result_{index}.json"
@@ -242,15 +336,17 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 run_draft,
                 str(output),
                 candidate if candidate in ("svd", "svd_lowrank") else "none",
+                input_graphs,
             ],
             check=True,
             env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
             timeout=300,
         )
         results.append(json.loads(output.read_text(encoding="utf-8")))
-    assert results[0]["outputs"] == results[1]["outputs"] == results[2]["outputs"]
+    assert results[0]["outputs"] == results[1]["outputs"] == results[2]["outputs"] == results[3]["outputs"]
     assert results[2]["stats"]
     assert all(all(value > 0 for value in stats.values()) for stats in results[2]["stats"])
+    assert all(stats["input_prep"] == 0 for stats in results[3]["stats"])
 
 
 if __name__ == "__main__":
