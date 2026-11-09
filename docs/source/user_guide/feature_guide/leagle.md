@@ -82,14 +82,19 @@ outside graphs and still synchronize once per batch. No graph or speedup claim i
 the CPU tests alone.
 
 In the optimized FULL path, projection graphs write their outputs into
-persistent feature/KV buffers. Separate native ACL cache-update graphs scatter
-verified suffixes into request slots, including partial prefills without draft
-proposals. Capture and padded writes target a private sink slot, protecting
+persistent feature/KV buffers. A separate native ACL cache-update graph scatters
+all verified suffixes in a batch into request slots in one replay, including
+partial prefills without draft proposals. Empty updates skip replay. CPU
+validation packs source/destination indices once and rejects duplicate slots,
+gaps and overflow before device writes. Capture and padding target private sink rows, protecting
 live prefixes. The rollout graph gathers anchors by device slot indices;
 slot/length metadata is staged together. Host request validation, grouping,
-input copies and verdict synchronization remain outside graphs. Each nonempty
-request suffix adds a cache-update replay, so measure its latency on the NPU.
-The sink slot and additional graph buckets also consume device memory.
+input copies and verdict synchronization remain outside graphs. Sixteen valid
+requests now require one cache-update replay rather than sixteen. K/V storage
+layout is unchanged, so generic IndexPut transpose costs are not eliminated.
+Measure native NPU replay and TPOT before claiming a speedup. Sink storage grows
+to `ceil(max_num_batched_tokens / max_model_len)` rows, and update buckets cover
+the batch token capacity; account for that extra memory when sizing the engine.
 
 The optimized executor enables these `speculative_config` options by default:
 `leagle_reuse_context_kv`, `leagle_static_draft_kv`, `leagle_batch_drafts`,

@@ -119,10 +119,12 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
         positions = torch.cat([torch.arange(start, start + count, device="npu") for _, start, count in rows])
         execution.project(torch.cat(inputs), positions, manager)
         begin = 0
+        updates = []
         for (slot, start, count), features in zip(rows, inputs):
-            execution.update(slot, str(slot), start, begin, begin + count, manager)
+            updates.append((slot, str(slot), start, begin, begin + count))
             history[slot] = features if start == 0 else torch.cat((history[slot][:start], features))
             begin += count
+        execution.update_batch(updates, manager)
         result = torch.full((2, 3), -1, dtype=torch.long, device="npu")
         execution.propose([(row, slot) for row, (slot, _, _) in enumerate(rows)], anchors, result, 3, manager)
         for row, (slot, _, _) in enumerate(rows):
@@ -130,7 +132,33 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
             expected = reference.propose_context(prefix, anchors[slot : slot + 1], 3)
             torch.testing.assert_close(result[row : row + 1], expected)
     assert manager.proposal_replays == manager.projection_replays == 2
-    assert manager.update_replays == 4
+    assert manager.update_replays == 2
+
+
+@torch.inference_mode()
+def test_native_cache_update_batches_sixteen_requests_in_one_replay():
+    torch.manual_seed(42)
+    model = _draft(_architecture()).to(device="npu", dtype=torch.bfloat16)
+    context = LEagleContext(16, 8, 32, dtype=torch.bfloat16, device="npu")
+    execution = LEagleExecution(model, context, 64, 3, LEagleExecutionOptions(), dtype=torch.bfloat16, device="npu")
+    manager = LEagleOptimizedGraphRunner(
+        execution, NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    )
+    manager.capture()
+    features = torch.randn(64, 96, device="npu", dtype=torch.bfloat16)
+    execution.project(features, torch.arange(64, device="npu") % 3, manager)
+    expected_features = execution.projected.clone()
+    expected_kv = tuple(tuple(t.clone() for t in pair) for pair in execution.new_kv)
+    updates = [(slot, str(slot), 0, slot * 3, slot * 3 + 3) for slot in range(16)]
+    execution.update_batch(updates, manager)
+    assert manager.update_replays == 1
+    execution.update_batch([], manager)
+    assert manager.update_replays == 1
+    for slot, _, _, begin, end in updates:
+        torch.testing.assert_close(context.values[slot, :3], expected_features[begin:end])
+        for cached, expected in zip(execution.prefix_kv, expected_kv):
+            for storage, value in zip(cached, expected):
+                torch.testing.assert_close(storage[slot : slot + 1, :, :3], value[:, :, begin:end])
 
 
 def _count_target_replays(worker):
