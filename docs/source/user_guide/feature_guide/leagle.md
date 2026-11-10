@@ -62,22 +62,29 @@ Set `leagle_lm_head_quantization="w8a8"` in `speculative_config` to create a
 private online INT8 head from the loaded BF16 draft weights. It keeps all draft
 vocabulary rows, uses per-row weight scales and per-token activation scales,
 then calls native `npu_dynamic_quant` and `npu_quant_matmul` for BF16 logits.
-The original target/draft weights are retained; no training or checkpoint
+After installation, the original BF16 draft LM head is released; the target
+weights and saved checkpoint remain unchanged. No training or checkpoint
 conversion is required. Native operator references:
 [dynamic quant](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_quant.md)
 and [quantized matmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_matmul.md).
 
 This is an Ascend LEAGLE implementation of the private low-precision proposal
 head idea, not a direct port of PR #59973's FP8/NVFP4 kernels. Initial support
-requires BF16, hidden/vocabulary multiples of 32 and the existing LEAGLE TP=1,
+requires BF16, hidden/vocabulary multiples of 32 and LEAGLE draft TP=1,
 greedy proposal restrictions. Candidate/SVD scoring is rejected: remove SVD
 rank and set `leagle_use_candidate_head=false` when using a candidate checkpoint.
 Default is disabled; use `None`/omit the option for the BF16 baseline.
 
 Weights are quantized in bounded FP32 chunks during model loading, and NZ
 packing follows the existing Ascend weight-format policy. Private buffers are
-nonpersistent and add memory on top of the retained BF16 weights. They are
-allocated before profiling/capture. Both eager and FULL use the same operators;
+nonpersistent and replace the BF16 draft head before profiling/capture. For
+151936 x 2560 weights, freeing the dense head saves about 742 MiB relative to
+retaining both, or about 371 MiB relative to BF16 alone, excluding scales and
+packing overhead. Initialization peak memory still includes both heads, and
+the allocator may reserve freed storage for reuse. Dense fallback is unavailable
+until restart with W8A8 disabled. The isolated benchmark retains its BF16
+baseline for comparisons; its total memory is not representative of serving.
+Both eager and FULL use the same operators;
 hot reload requires engine restart and recapture. No unsupported-kernel CPU
 fallback or automatic acceptance-preserving promise is made.
 
@@ -96,7 +103,27 @@ quality. Quantization can change draft token choices. Compare real-checkpoint
 acceptance, output quality and TPOT against BF16. Native hardware tests are
 provided, but cannot be replaced by CPU emulation tests.
 
-This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
+This implementation requires Model Runner V2, a Qwen3 target and PP=DCP=PCP=1.
+Target TP can exceed one: add `--tensor-parallel-size 2` for two NPUs.
+The LEAGLE draft TP defaults to one. Every TP worker loads the full draft,
+including context/KV buffers and any private W8A8 or candidate/SVD head.
+This replicates draft memory on every NPU; it does not shard the draft LM head
+or reduce its per-token projection cost. Rank-zero draft proposals are broadcast
+after each real rollout, outside ACL graphs. Sequence parallel target features
+are rejected. Both repositories must be updated together.
+
+The existing accuracy test includes TP=2 cases (requires two visible NPUs):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 pytest -sv \
+  tests/e2e/pull_request/one_card/aclgraph/test_leagle_full.py \
+  -k target_and_draft_full_match_target_only_and_eager
+```
+
+The TP=2 cases check target-only/eager/FULL greedy output agreement and graph
+replays on both workers, including candidate, SVD and W8A8 heads. These require
+actual NPU execution; CPU contract tests do not establish hardware correctness.
+
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.
 `FULL_DECODE_ONLY` captures target verification while leaving prefill eager.
