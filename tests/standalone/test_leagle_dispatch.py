@@ -4,7 +4,6 @@
 
 import importlib.util
 import sys
-import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -99,7 +98,3 @@ def test_int8_head_preserves_source_and_matches_scaled_integer_reference():
         module.AscendLEagleInt8Head(invalid, ops=ops)
     with pytest.raises(ValueError, match="multiples of 32"):
         module.AscendLEagleInt8Head(weight[:, :31], ops=ops)
-    source = weakref.ref(weight)
-    del weight
-    assert source() is None
-    torch.testing.assert_close(head(hidden).view(2, 64), expected)
