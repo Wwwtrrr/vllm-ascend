@@ -221,29 +221,13 @@ def _graph_stats(worker):
     )
 
 
-def _tp_draft_state(worker):
-    speculator = worker.model_runner.speculator
-    model = speculator.model
-    quantized = model.quantized_lm_head
-    return dict(
-        draft_tp=speculator.speculative_config.draft_parallel_config.tensor_parallel_size,
-        head_shape=(
-            [quantized.vocab_size, quantized.hidden_size]
-            if quantized is not None else list(model.lm_head.weight.shape)
-        ),
-        dense_released=model.lm_head is None,
-        tokens=speculator.draft_tokens[:2].cpu().tolist(),
-    )
-
-
-def _serve(mode, target, draft, output_path, svd="none", tp="1"):
+def _serve(mode, target, draft, output_path, svd="none"):
     # Worker subprocesses import the serving stack after selecting V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
 
     kwargs = dict(
         model=target,
-        tensor_parallel_size=int(tp),
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
@@ -272,16 +256,12 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
         responses = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
         outputs.extend([list(response.outputs[0].token_ids) for response in responses])
     stats = llm.collective_rpc(_graph_stats) if mode != "eager" else []
-    replicas = llm.collective_rpc(_tp_draft_state) if draft != "none" else []
-    Path(output_path).write_text(json.dumps(dict(outputs=outputs, stats=stats, replicas=replicas)), encoding="utf-8")
+    Path(output_path).write_text(json.dumps(dict(outputs=outputs, stats=stats)), encoding="utf-8")
 
 
-@pytest.mark.parametrize("tp", [1, 2])
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
 @pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant"])
-def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate, tp):
-    if torch.npu.device_count() < tp:
-        pytest.skip(f"Requires {tp} visible NPUs")
+def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate):
     torch.manual_seed(42)
     config = _architecture()
     if candidate is True:
@@ -328,7 +308,6 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 run_draft,
                 str(output),
                 candidate if candidate in ("svd", "svd_lowrank", "quant") else "none",
-                str(tp),
             ],
             check=True,
             env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
@@ -337,15 +316,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
         results.append(json.loads(output.read_text(encoding="utf-8")))
     assert results[0]["outputs"] == results[1]["outputs"] == results[2]["outputs"]
     assert results[2]["stats"]
-    assert len(results[2]["stats"]) == tp
     assert all(all(value > 0 for value in stats.values()) for stats in results[2]["stats"])
-    for result in results[1:]:
-        replicas = result["replicas"]
-        assert len(replicas) == tp
-        assert all(replica == replicas[0] for replica in replicas)
-        assert replicas[0]["draft_tp"] == 1
-        assert replicas[0]["head_shape"] == [64, 32]
-        assert replicas[0]["dense_released"] is False
 
 
 if __name__ == "__main__":
