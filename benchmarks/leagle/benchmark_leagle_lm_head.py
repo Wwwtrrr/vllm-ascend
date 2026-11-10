@@ -156,6 +156,88 @@ def benchmark_fused(
         torch.npu.synchronize()
 
 
+def benchmark_int8(torch, torch_npu, hidden, weight, args, report):
+    import importlib.util
+
+    import torch.nn.functional as F
+
+    relative = Path("vllm_ascend/worker/v2/spec_decode/leagle_quant.py")
+    candidates = [
+        Path(__file__).resolve().parents[2] / relative,
+        Path(__file__).resolve().parent / "vllm-ascend" / relative,
+    ]
+    source = next((p for p in candidates if p.is_file()), None)
+    if source is None:
+        raise FileNotFoundError("Run from the updated vllm-ascend benchmarks/leagle checkout")
+    spec = importlib.util.spec_from_file_location("leagle_int8_benchmark", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    formatter = (lambda w: torch_npu.npu_format_cast(w, 29)) if args.int8_format == "nz" else (lambda w: w)
+    head = module.AscendLEagleInt8Head(weight, ops=torch_npu, weight_format=formatter)
+    original = hidden.clone()
+    matches, tested, error_sq, reference_sq = 0, 0, 0.0, 0.0
+    try:
+        torch.manual_seed(args.seed + 2)
+        for case in range(args.correctness_cases + 1):
+            if case == 0:
+                hidden.zero_()
+            else:
+                hidden.normal_()
+            reference = F.linear(hidden, weight)
+            actual = head(hidden)
+            if not torch.isfinite(actual).all():
+                raise RuntimeError("INT8 head produced non-finite logits")
+            matches += int((actual.argmax(-1) == reference.argmax(-1)).sum().item())
+            tested += actual.shape[0]
+            error_sq += float((actual.float() - reference.float()).square().sum().item())
+            reference_sq += float(reference.float().square().sum().item())
+        report["int8_validation"] = {
+            "format": args.int8_format,
+            "cases": args.correctness_cases + 1,
+            "top1_agreement": matches / tested,
+            "relative_rmse": (error_sq / max(reference_sq, 1e-30)) ** 0.5,
+            "private_weight_MiB": (
+                head.weight_int8.numel() * head.weight_int8.element_size()
+                + head.weight_scale.numel() * head.weight_scale.element_size()
+            )
+            / 1024**2,
+            "note": "Random inputs only; not model acceptance or quality evaluation",
+        }
+        print("INT8 VALIDATION:", report["int8_validation"], flush=True)
+        hidden.copy_(original)
+        for with_argmax in (False, True):
+            label = "int8_argmax" if with_argmax else "int8_linear"
+            native = "linear_argmax" if with_argmax else "linear"
+
+            def forward(with_argmax=with_argmax):
+                for _ in range(args.steps):
+                    logits = head(hidden)
+                    output = logits.argmax(-1) if with_argmax else logits
+                return output
+
+            eager = measure(torch, forward, args.warmup, args.repeats, args.trials, args.steps)
+            captured = capture(torch, forward, hidden.device)
+            graph, output, _, _ = captured
+            hidden.normal_()
+            expected = forward().clone()
+            graph.replay()
+            torch.npu.synchronize()
+            torch.testing.assert_close(output, expected)
+            hidden.copy_(original)
+            graphed = measure(torch, graph.replay, args.warmup, args.repeats, args.trials, args.steps)
+            for mode, result in (("eager", eager), ("graph", graphed)):
+                ms = result["device_interval_ms_per_step_median"]
+                baseline = report["results"][f"{native}_{mode}"]["device_interval_ms_per_step_median"]
+                result["speedup_vs_native"] = baseline / ms
+                report["results"][f"{label}_{mode}"] = result
+                print(f"{label} {mode}: {ms:.6f} ms/step; speedup {baseline / ms:.3f}x", flush=True)
+            torch.npu.synchronize()
+            del output, graph, captured, expected
+    finally:
+        hidden.copy_(original)
+        torch.npu.synchronize()
+
+
 def save_report(report, output):
     if output:
         output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -176,6 +258,8 @@ def main():
     parser.add_argument("--repeats", type=positive_int, default=100)
     parser.add_argument("--trials", type=positive_int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--try-int8", action="store_true", help="Benchmark native NPU W8A8 full-vocabulary head")
+    parser.add_argument("--int8-format", choices=("nd", "nz"), default="nz")
     parser.add_argument("--try-dot", action="store_true", help="Test BF16 tl.dot prototype")
     parser.add_argument(
         "--sweep-dot",
@@ -354,6 +438,9 @@ def main():
                 print("No configuration passed; no fused performance result is valid.")
             elif ranked[0]["graph"]["device_interval_ms_per_step_median"] >= baseline:
                 print("No fused configuration beats the native baseline; keep the native path.")
+        if args.try_int8:
+            save_report(report, args.output)
+            benchmark_int8(torch, torch_npu, hidden, weight, args, report)
         print("Weight bytes / interval is an estimate, not measured HBM bandwidth.")
         if args.output:
             args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

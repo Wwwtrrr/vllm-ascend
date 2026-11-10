@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
 )
 
 from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
 
 
 def _draft(config):
@@ -94,7 +95,7 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank"])
+@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant"])
 def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     torch.manual_seed(42)
     config = _architecture()
@@ -103,6 +104,14 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     model = _draft(config).to(device="npu", dtype=torch.bfloat16)
     if candidate in ("svd", "svd_lowrank"):
         model.configure_output_head(svd_rank=8, top_k=7 if candidate == "svd" else None, rerank=candidate == "svd")
+    if candidate == "quant":
+        import torch_npu
+
+        model.set_quantized_lm_head(
+            AscendLEagleInt8Head(
+                model.lm_head.weight, ops=torch_npu, weight_format=lambda w: torch_npu.npu_format_cast(w, 29)
+            )
+        )
     reference = copy.deepcopy(model)
     adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
     model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
@@ -161,6 +170,33 @@ def test_native_cache_update_batches_sixteen_requests_in_one_replay():
                 torch.testing.assert_close(storage[slot : slot + 1, :, :3], value[:, :, begin:end])
 
 
+@torch.inference_mode()
+def test_native_int8_full_head_matches_integer_reference_and_changed_input_replay():
+    import torch_npu
+
+    torch.manual_seed(42)
+    weight = torch.randn(64, 32, dtype=torch.bfloat16, device="npu")
+    before = weight.clone()
+    head = AscendLEagleInt8Head(weight, ops=torch_npu, weight_format=lambda w: w)
+    hidden = torch.randn(2, 1, 32, dtype=torch.bfloat16, device="npu")
+    backend = NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    graph, output = backend.capture(lambda: head(hidden))
+    for _ in range(3):
+        hidden.normal_()
+        q, scale = torch_npu.npu_dynamic_quant(hidden.view(2, 32), dst_type=torch.int8)
+        expected = (
+            (q.cpu().int() @ head.weight_int8.cpu().int()).float()
+            * scale.cpu().reshape(-1, 1)
+            * head.weight_scale.cpu()[None, :]
+        ).to(torch.bfloat16)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output.view(2, 64).cpu(), expected)
+        torch.testing.assert_close(output, head(hidden))
+    torch.testing.assert_close(weight, before)
+    assert not head.state_dict()
+
+
 def _count_target_replays(worker):
     manager = worker.model_runner.cudagraph_manager
     assert manager.graphs, "Target FULL graph capture was skipped"
@@ -203,7 +239,9 @@ def _serve(mode, target, draft, output_path, svd="none"):
     )
     if draft != "none":
         kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
-        if svd != "none":
+        if svd == "quant":
+            kwargs["speculative_config"]["leagle_lm_head_quantization"] = "w8a8"
+        elif svd != "none":
             kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
             if svd == "svd":
                 kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
@@ -222,7 +260,7 @@ def _serve(mode, target, draft, output_path, svd="none"):
 
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
-@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank"])
+@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant"])
 def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate):
     torch.manual_seed(42)
     config = _architecture()
@@ -269,7 +307,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 str(target_path),
                 run_draft,
                 str(output),
-                candidate if candidate in ("svd", "svd_lowrank") else "none",
+                candidate if candidate in ("svd", "svd_lowrank", "quant") else "none",
             ],
             check=True,
             env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},

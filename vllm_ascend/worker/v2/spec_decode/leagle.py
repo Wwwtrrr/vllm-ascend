@@ -11,6 +11,18 @@ from vllm.v1.worker.gpu.spec_decode.leagle.speculator import LEagleSpeculator
 class AscendLEagleSpeculator(LEagleSpeculator):
     """PyTorch SDPA on NPU, with native ACL FULL graphs for the drafter."""
 
+    def configure_lm_head_quantization(self):
+        mode = getattr(self.speculative_config, "leagle_lm_head_quantization", None)
+        if mode is None:
+            return
+        if mode != "w8a8":
+            raise ValueError("Ascend LEAGLE only supports w8a8 full-head quantization")
+        if self.model.candidate_head_enabled or self.model.svd_candidate_head is not None:
+            raise ValueError("LEAGLE W8A8 cannot combine with candidate/SVD scoring")
+        from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
+
+        self.model.set_quantized_lm_head(AscendLEagleInt8Head(self.model.lm_head.weight))
+
     def create_graph_backend(self):
         return NativeLEagleGraphBackend(torch.npu, self.device, torch.npu.NPUGraph)
 

@@ -56,6 +56,46 @@ with initialization start/end logs. The original dense head stays resident;
 factors add device memory and are recomputed at every startup, not cached on
 disk or added to saved checkpoints.
 
+## INT8 full-vocabulary draft head
+
+Set `leagle_lm_head_quantization="w8a8"` in `speculative_config` to create a
+private online INT8 head from the loaded BF16 draft weights. It keeps all draft
+vocabulary rows, uses per-row weight scales and per-token activation scales,
+then calls native `npu_dynamic_quant` and `npu_quant_matmul` for BF16 logits.
+The original target/draft weights are retained; no training or checkpoint
+conversion is required. Native operator references:
+[dynamic quant](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_quant.md)
+and [quantized matmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_matmul.md).
+
+This is an Ascend LEAGLE implementation of the private low-precision proposal
+head idea, not a direct port of PR #59973's FP8/NVFP4 kernels. Initial support
+requires BF16, hidden/vocabulary multiples of 32 and the existing LEAGLE TP=1,
+greedy proposal restrictions. Candidate/SVD scoring is rejected: remove SVD
+rank and set `leagle_use_candidate_head=false` when using a candidate checkpoint.
+Default is disabled; use `None`/omit the option for the BF16 baseline.
+
+Weights are quantized in bounded FP32 chunks during model loading, and NZ
+packing follows the existing Ascend weight-format policy. Private buffers are
+nonpersistent and add memory on top of the retained BF16 weights. They are
+allocated before profiling/capture. Both eager and FULL use the same operators;
+hot reload requires engine restart and recapture. No unsupported-kernel CPU
+fallback or automatic acceptance-preserving promise is made.
+
+Run the isolated benchmark before serving:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=7 python benchmarks/leagle/benchmark_leagle_lm_head.py \
+  --steps 7 --try-int8 --int8-format nz \
+  --warmup 5 --repeats 20 --trials 5 --output lm_head_int8.json
+```
+
+The benchmark uses the same head implementation, with explicit NZ format;
+`--int8-format nd` provides a layout comparison. It reports random-input top-1
+agreement/error separately from eager/FULL timings, not model acceptance or
+quality. Quantization can change draft token choices. Compare real-checkpoint
+acceptance, output quality and TPOT against BF16. Native hardware tests are
+provided, but cannot be replaced by CPU emulation tests.
+
 This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.
