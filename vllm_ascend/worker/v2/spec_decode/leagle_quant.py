@@ -10,7 +10,7 @@ class AscendLEagleInt8Head(nn.Module):
     """Per-output weight scales and per-token activation scales; no disk state.
 
     Uses npu_dynamic_quant + npu_quant_matmul without retaining the source
-    weight. Serving releases the dense draft head after installation.
+    weight. Serving retains the original dense draft head separately.
     Injected ops/formatting allow CPU contract tests only; production
     has no emulation fallback. CANN/NPU support must be validated on hardware.
     """

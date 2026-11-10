@@ -345,7 +345,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
         assert all(replica == replicas[0] for replica in replicas)
         assert replicas[0]["draft_tp"] == 1
         assert replicas[0]["head_shape"] == [64, 32]
-        assert replicas[0]["dense_released"] == (candidate == "quant")
+        assert replicas[0]["dense_released"] is False
 
 
 if __name__ == "__main__":
