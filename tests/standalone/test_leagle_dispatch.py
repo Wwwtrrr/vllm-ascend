@@ -49,6 +49,22 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     npu = SimpleNamespace(NPUGraph=object)
     monkeypatch.setattr(torch, "npu", npu, raising=False)
     assert proposer.create_graph_backend() == (npu, "npu:0", object)
+    quant = ModuleType("vllm_ascend.worker.v2.spec_decode.leagle_quant")
+    quant.AscendLEagleInt8Head = lambda weight: ("int8", weight)
+    monkeypatch.setitem(sys.modules, quant.__name__, quant)
+    installed = []
+    weight = torch.randn(64, 32)
+    proposer.speculative_config = SimpleNamespace(leagle_lm_head_quantization="w8a8")
+    proposer.model = SimpleNamespace(
+        candidate_head_enabled=True,
+        svd_candidate_head=SimpleNamespace(up_weight=weight),
+        set_quantized_svd_head=installed.append,
+    )
+    proposer.configure_lm_head_quantization()
+    assert installed == [("int8", weight)]
+    proposer.model.svd_candidate_head = None
+    with pytest.raises(ValueError, match="requires SVD"):
+        proposer.configure_lm_head_quantization()
 
 
 @torch.inference_mode()

@@ -70,8 +70,8 @@ and [quantized matmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/c
 This is an Ascend LEAGLE implementation of the private low-precision proposal
 head idea, not a direct port of PR #59973's FP8/NVFP4 kernels. Initial support
 requires BF16, hidden/vocabulary multiples of 32 and the existing LEAGLE TP=1,
-greedy proposal restrictions. Candidate/SVD scoring is rejected: remove SVD
-rank and set `leagle_use_candidate_head=false` when using a candidate checkpoint.
+greedy proposal restrictions. Without SVD, candidate scoring is rejected:
+set `leagle_use_candidate_head=false` when using a candidate checkpoint.
 Default is disabled; use `None`/omit the option for the BF16 baseline.
 
 Weights are quantized in bounded FP32 chunks during model loading, and NZ
@@ -80,6 +80,32 @@ nonpersistent and add memory on top of the retained BF16 weights. They are
 allocated before profiling/capture. Both eager and FULL use the same operators;
 hot reload requires engine restart and recapture. No unsupported-kernel CPU
 fallback or automatic acceptance-preserving promise is made.
+
+SVD can be combined with W8A8 using:
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/leagle/checkpoint",
+    "num_speculative_tokens": 7,
+    "leagle_candidate_svd_rank": 256,
+    "leagle_candidate_top_k": 128,
+    "leagle_candidate_rerank": True,
+    "leagle_lm_head_quantization": "w8a8",
+}
+```
+
+The path is BF16 hidden-to-rank projection, W8A8 rank-to-vocabulary projection,
+TopK retrieval, then original BF16 candidate rescoring. Only the large SVD
+up-projection is quantized; rank and draft vocabulary must be multiples of 32.
+The original dense head and BF16 SVD factors remain resident. Trained candidate
+heads without inference SVD remain unsupported. Do not disable the candidate
+head with SVD enabled. For pure low-rank scoring, set rerank false and omit TopK.
+Both eager and FULL use the combined head, initialized before capture; changing
+scoring requires restart. This remains TP=1. Quantization can change candidate
+recall and acceptance, and does not guarantee lower TPOT. Compare identical
+SVD/rank/TopK settings with and without W8A8 on actual NPU hardware. Native
+tests include `svd_quant` eager/FULL serving and graph replay cases.
 
 Run the isolated benchmark before serving:
 
