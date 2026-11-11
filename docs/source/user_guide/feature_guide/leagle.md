@@ -69,7 +69,7 @@ and [quantized matmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/c
 
 This is an Ascend LEAGLE implementation of the private low-precision proposal
 head idea, not a direct port of PR #59973's FP8/NVFP4 kernels. Initial support
-requires BF16, hidden/vocabulary multiples of 32 and the existing LEAGLE TP=1,
+requires BF16, hidden/vocabulary shard sizes divisible by 32 and the LEAGLE
 greedy proposal restrictions. Without SVD, candidate scoring is rejected:
 set `leagle_use_candidate_head=false` when using a candidate checkpoint.
 Default is disabled; use `None`/omit the option for the BF16 baseline.
@@ -102,7 +102,7 @@ The original dense head and BF16 SVD factors remain resident. Trained candidate
 heads without inference SVD remain unsupported. Do not disable the candidate
 head with SVD enabled. For pure low-rank scoring, set rerank false and omit TopK.
 Both eager and FULL use the combined head, initialized before capture; changing
-scoring requires restart. This remains TP=1. Quantization can change candidate
+scoring requires restart. Target and draft TP must match. Quantization can change candidate
 recall and acceptance, and does not guarantee lower TPOT. Compare identical
 SVD/rank/TopK settings with and without W8A8 on actual NPU hardware. Native
 tests include `svd_quant` eager/FULL serving and graph replay cases.
@@ -121,6 +121,8 @@ reranking), relative to retaining both representations. Release occurs before
 profiling/capture, does not reduce quantization-time peak memory, and does not
 guarantee avoiding OOM. Allocator-reserved storage may remain visible but is
 reusable. Restart to switch modes; no hot reload or BF16 fallback afterwards.
+The figures above are for TP=1; per-rank savings with TP follow the local shard
+size, approximately divided by TP with vocabulary padding overhead.
 Checkpoint files are not modified. Isolated benchmarks keep their BF16 baseline.
 
 Run the isolated benchmark before serving:
@@ -138,7 +140,7 @@ quality. Quantization can change draft token choices. Compare real-checkpoint
 acceptance, output quality and TPOT against BF16. Native hardware tests are
 provided, but cannot be replaced by CPU emulation tests.
 
-This implementation requires Model Runner V2, a Qwen3 target and TP=PP=DCP=PCP=1.
+This implementation requires Model Runner V2, a Qwen3 target and PP=DCP=PCP=1.
 It supports eager execution and FULL target/draft ACL graphs. Use
 `--enforce-eager` without the compilation option above for eager execution.
 `FULL_DECODE_ONLY` captures target verification while leaving prefill eager.
@@ -197,6 +199,63 @@ additional memory. Start with small request/length limits and check available
 memory before increasing them. Cached K/V requires fixed runtime RoPE scaling.
 These changes do not add paged FIA attention. Training chunked loss and DDP
 remain training-repository settings, not vLLM/Ascend serving options.
+
+## Tensor-parallel LEAGLE
+
+Target and draft use the same TP group. For two NPUs:
+
+```python
+llm = LLM(
+    model="/path/to/Qwen3-4B",
+    tensor_parallel_size=2,
+    enable_prefix_caching=False,
+    enforce_eager=False,
+    compilation_config={
+        "cudagraph_mode": "FULL",
+        "pass_config": {"enable_sp": False},
+    },
+    speculative_config={
+        "method": "leagle",
+        "model": "/path/to/leagle/checkpoint",
+        "draft_tensor_parallel_size": 2,
+        "num_speculative_tokens": 7,
+    },
+)
+```
+
+Select both devices with `ASCEND_RT_VISIBLE_DEVICES=0,1` and enable Model Runner
+V2 as in the examples above. Draft TP can be omitted to inherit target TP;
+target TP=2 with draft TP=1 is rejected. Eager uses the same sharded model.
+
+Full training checkpoints are sliced on loading; no sharded checkpoint export
+or retraining is needed. Attention Q heads and MLP intermediate channels split
+across ranks. KV heads split when possible, and replicate when TP exceeds the
+KV head count. Embedding/LM head/candidate up-projections partition vocabulary
+rows, padding each local shard to multiples of 32. Normalization, auxiliary
+feature/recurrent projections, low-rank down-projections and token maps remain
+replicated. Static/context/draft KV buffers use local KV heads; projected hidden
+context buffers retain the full hidden dimension.
+
+Attention/MLP row outputs use the framework TP reductions. Full/coarse logits
+are gathered before selection; TopK candidate IDs are broadcast from rank zero,
+and exact scores are reduced from the owning original-head shards. SVD builds
+the global FP64 Gram matrix over the TP CPU group and broadcasts the rank-zero
+basis. W8A8 quantizes each local vocabulary shard, including SVD up-projections;
+the opt-in source release flag continues to work. This does not gather BF16
+weight matrices on each draft step.
+
+PP/DCP/PCP must remain one, sequence parallel target features are rejected,
+and target/draft TP must match. Attention head and MLP sizes must be compatible
+with TP. FULL captures the sharded SDPA rollout and its collective operations.
+HCCL capture and replay require validation on the installed CANN/torch_npu
+stack. CPU TP=2/4 algebra and real two-process Gloo tests establish CPU
+correctness, not native graph correctness or performance. Small-batch TP can
+be slower due to communication; compare acceptance and TPOT before deployment.
+
+The native serving tests below include TP=1 and TP=2 for dense, candidate,
+SVD, W8A8 and SVD+W8A8 paths. TP=2 cases skip without two visible NPUs. Run with
+`ASCEND_RT_VISIBLE_DEVICES=0,1` to validate both workers' shard dimensions,
+proposal agreement and target/draft FULL replay counters.
 
 Run output-parity and acceptance evaluations on an NPU with the actual trained
 checkpoint before measuring serving performance. The CPU factory test is:

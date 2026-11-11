@@ -234,13 +234,26 @@ def _graph_stats(worker):
     )
 
 
-def _serve(mode, target, draft, output_path, svd="none"):
+def _tp_state(worker):
+    model = worker.model_runner.speculator.model
+    return dict(
+        size=model.tp.size,
+        local_head_rows=model.local_vocab_size,
+        local_q_heads=model.layers[0].self_attn.num_heads,
+        local_kv_heads=model.layers[0].self_attn.num_kv_heads,
+        local_mlp=model.layers[0].mlp.gate_proj.out_features,
+        proposals=worker.model_runner.speculator.draft_tokens[:2].cpu().tolist(),
+    )
+
+
+def _serve(mode, target, draft, output_path, svd="none", tp="1"):
     # Worker subprocesses import the serving stack after selecting V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
 
     kwargs = dict(
         model=target,
+        tensor_parallel_size=int(tp),
         skip_tokenizer_init=True,
         dtype="bfloat16",
         max_model_len=128,
@@ -268,7 +281,12 @@ def _serve(mode, target, draft, output_path, svd="none"):
         if svd in ("quant", "svd_quant"):
             kwargs["speculative_config"]["leagle_release_quantized_source"] = True
     if mode != "eager":
-        kwargs["compilation_config"] = dict(cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16])
+        kwargs["compilation_config"] = dict(
+            cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16],
+            pass_config=dict(enable_sp=False),
+        )
+    else:
+        kwargs["compilation_config"] = dict(pass_config=dict(enable_sp=False))
     llm = LLM(**kwargs)
     if mode != "eager":
         llm.collective_rpc(_count_target_replays)
@@ -278,12 +296,16 @@ def _serve(mode, target, draft, output_path, svd="none"):
         responses = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
         outputs.extend([list(response.outputs[0].token_ids) for response in responses])
     stats = llm.collective_rpc(_graph_stats) if mode != "eager" else []
-    Path(output_path).write_text(json.dumps(dict(outputs=outputs, stats=stats)), encoding="utf-8")
+    shards = llm.collective_rpc(_tp_state) if draft != "none" else []
+    Path(output_path).write_text(json.dumps(dict(outputs=outputs, stats=stats, shards=shards)), encoding="utf-8")
 
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
+@pytest.mark.parametrize("tp", [1, 2])
 @pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant", "svd_quant"])
-def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate):
+def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate, tp):
+    if torch.npu.device_count() < tp:
+        pytest.skip(f"Requires {tp} visible NPUs")
     torch.manual_seed(42)
     config = _architecture()
     if candidate is True:
@@ -330,6 +352,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 run_draft,
                 str(output),
                 candidate if candidate in ("svd", "svd_lowrank", "quant", "svd_quant") else "none",
+                str(tp),
             ],
             check=True,
             env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
@@ -339,6 +362,16 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
     assert results[0]["outputs"] == results[1]["outputs"] == results[2]["outputs"]
     assert results[2]["stats"]
     assert all(all(value > 0 for value in stats.values()) for stats in results[2]["stats"])
+    assert len(results[2]["stats"]) == tp
+    for result in results[1:]:
+        shards = result["shards"]
+        assert len(shards) == tp
+        assert all(shard == shards[0] for shard in shards)
+        assert shards[0]["size"] == tp
+        assert shards[0]["local_head_rows"] == 64 // tp
+        assert shards[0]["local_q_heads"] == 4 // tp
+        assert shards[0]["local_kv_heads"] == 2 // tp
+        assert shards[0]["local_mlp"] == 64 // tp
 
 
 if __name__ == "__main__":
