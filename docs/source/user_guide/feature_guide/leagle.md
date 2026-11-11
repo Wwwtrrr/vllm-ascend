@@ -107,6 +107,22 @@ recall and acceptance, and does not guarantee lower TPOT. Compare identical
 SVD/rank/TopK settings with and without W8A8 on actual NPU hardware. Native
 tests include `svd_quant` eager/FULL serving and graph replay cases.
 
+To release unused BF16 source weights after successful quantization, add
+`"leagle_release_quantized_source": True` to the Python speculative config
+(use lowercase `true` in JSON). Default is false, preserving existing behavior.
+Full-head W8A8 releases the dense draft head. SVD W8A8 releases the BF16
+up-projection; the dense original head stays for candidate reranking, and is
+released only when reranking is disabled. The BF16 SVD down-projection and
+target weights remain unchanged.
+
+For vocabulary 151936, hidden 2560 and rank 256, this frees approximately
+742 MiB (full head), 74 MiB (SVD with reranking), or 816 MiB (SVD without
+reranking), relative to retaining both representations. Release occurs before
+profiling/capture, does not reduce quantization-time peak memory, and does not
+guarantee avoiding OOM. Allocator-reserved storage may remain visible but is
+reusable. Restart to switch modes; no hot reload or BF16 fallback afterwards.
+Checkpoint files are not modified. Isolated benchmarks keep their BF16 baseline.
+
 Run the isolated benchmark before serving:
 
 ```bash

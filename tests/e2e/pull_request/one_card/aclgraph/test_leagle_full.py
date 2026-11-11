@@ -108,18 +108,23 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
         model.configure_output_head(svd_rank=32, top_k=7, rerank=True)
         adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
         adapter.model = model
-        adapter.speculative_config = SimpleNamespace(leagle_lm_head_quantization="w8a8")
+        adapter.speculative_config = SimpleNamespace(
+            leagle_lm_head_quantization="w8a8", leagle_release_quantized_source=True
+        )
         adapter.configure_lm_head_quantization()
         assert model.has_quantized_svd_head
         assert model.lm_head is not None
+        assert model.svd_candidate_head.up_weight is None
     if candidate == "quant":
         import torch_npu
 
         model.set_quantized_lm_head(
             AscendLEagleInt8Head(
                 model.lm_head.weight, ops=torch_npu, weight_format=lambda w: torch_npu.npu_format_cast(w, 29)
-            )
+            ),
+            release_source=True,
         )
+        assert model.lm_head is None
     reference = copy.deepcopy(model)
     adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
     model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
@@ -260,6 +265,8 @@ def _serve(mode, target, draft, output_path, svd="none"):
             kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
             if svd == "svd":
                 kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
+        if svd in ("quant", "svd_quant"):
+            kwargs["speculative_config"]["leagle_release_quantized_source"] = True
     if mode != "eager":
         kwargs["compilation_config"] = dict(cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16])
     llm = LLM(**kwargs)

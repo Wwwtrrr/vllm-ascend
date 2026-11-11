@@ -58,10 +58,13 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     proposer.model = SimpleNamespace(
         candidate_head_enabled=True,
         svd_candidate_head=SimpleNamespace(up_weight=weight),
-        set_quantized_svd_head=installed.append,
+        set_quantized_svd_head=lambda head, **kwargs: installed.append((head, kwargs)),
     )
     proposer.configure_lm_head_quantization()
-    assert installed == [("int8", weight)]
+    assert installed == [(("int8", weight), {"release_source": False})]
+    proposer.speculative_config.leagle_release_quantized_source = True
+    proposer.configure_lm_head_quantization()
+    assert installed[-1] == (("int8", weight), {"release_source": True})
     proposer.model.svd_candidate_head = None
     with pytest.raises(ValueError, match="requires SVD"):
         proposer.configure_lm_head_quantization()

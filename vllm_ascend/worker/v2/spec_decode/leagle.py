@@ -19,14 +19,18 @@ class AscendLEagleSpeculator(LEagleSpeculator):
             raise ValueError("Ascend LEAGLE only supports w8a8 full-head quantization")
         from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
 
+        release = getattr(self.speculative_config, "leagle_release_quantized_source", False)
         if self.model.svd_candidate_head is not None:
             self.model.set_quantized_svd_head(
-                AscendLEagleInt8Head(self.model.svd_candidate_head.up_weight)
+                AscendLEagleInt8Head(self.model.svd_candidate_head.up_weight),
+                release_source=release,
             )
             return
         if self.model.candidate_head_enabled:
             raise ValueError("LEAGLE W8A8 requires SVD for candidate scoring")
-        self.model.set_quantized_lm_head(AscendLEagleInt8Head(self.model.lm_head.weight))
+        self.model.set_quantized_lm_head(
+            AscendLEagleInt8Head(self.model.lm_head.weight), release_source=release
+        )
 
     def create_graph_backend(self):
         return NativeLEagleGraphBackend(torch.npu, self.device, torch.npu.NPUGraph)
