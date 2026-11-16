@@ -95,12 +95,18 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant", "svd_quant"])
+@pytest.mark.parametrize("candidate", [
+    False, True, "svd", "svd_lowrank", "quant", "svd_quant",
+    "candidate_quant", "candidate_quant_direct",
+])
 def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
     torch.manual_seed(42)
     config = _architecture()
     if candidate is True:
         config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        config.update(candidate_head=True, candidate_head_rank=32, candidate_head_top_k=7,
+                      candidate_rerank=candidate != "candidate_quant_direct")
     model = _draft(config).to(device="npu", dtype=torch.bfloat16)
     if candidate in ("svd", "svd_lowrank"):
         model.configure_output_head(svd_rank=8, top_k=7 if candidate == "svd" else None, rerank=candidate == "svd")
@@ -115,6 +121,16 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
         assert model.has_quantized_svd_head
         assert model.lm_head is not None
         assert model.svd_candidate_head.up_weight is None
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
+        adapter.model = model
+        adapter.speculative_config = SimpleNamespace(
+            leagle_lm_head_quantization="w8a8", leagle_release_quantized_source=True
+        )
+        adapter.configure_lm_head_quantization()
+        assert model.has_quantized_candidate_head
+        assert model.candidate_head.up_proj is None
+        assert (model.lm_head is None) == (candidate == "candidate_quant_direct")
     if candidate == "quant":
         import torch_npu
 
@@ -184,19 +200,20 @@ def test_native_cache_update_batches_sixteen_requests_in_one_replay():
 
 
 @torch.inference_mode()
-def test_native_int8_full_head_matches_integer_reference_and_changed_input_replay():
+@pytest.mark.parametrize("width", [32, 640])
+def test_native_int8_full_head_matches_integer_reference_and_changed_input_replay(width):
     import torch_npu
 
     torch.manual_seed(42)
-    weight = torch.randn(64, 32, dtype=torch.bfloat16, device="npu")
+    weight = torch.randn(64, width, dtype=torch.bfloat16, device="npu")
     before = weight.clone()
     head = AscendLEagleInt8Head(weight, ops=torch_npu, weight_format=lambda w: w)
-    hidden = torch.randn(2, 1, 32, dtype=torch.bfloat16, device="npu")
+    hidden = torch.randn(2, 1, width, dtype=torch.bfloat16, device="npu")
     backend = NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
     graph, output = backend.capture(lambda: head(hidden))
     for _ in range(3):
         hidden.normal_()
-        q, scale = torch_npu.npu_dynamic_quant(hidden.view(2, 32), dst_type=torch.int8)
+        q, scale = torch_npu.npu_dynamic_quant(hidden.view(2, width), dst_type=torch.int8)
         expected = (
             (q.cpu().int() @ head.weight_int8.cpu().int()).float()
             * scale.cpu().reshape(-1, 1)
@@ -267,6 +284,14 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
         kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
         if svd == "quant":
             kwargs["speculative_config"]["leagle_lm_head_quantization"] = "w8a8"
+        elif svd in ("candidate_quant", "candidate_quant_direct"):
+            kwargs["speculative_config"].update(
+                leagle_use_candidate_head=True,
+                leagle_candidate_rerank=svd != "candidate_quant_direct",
+                leagle_lm_head_quantization="w8a8",
+            )
+            if svd == "candidate_quant":
+                kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
         elif svd == "svd_quant":
             kwargs["speculative_config"].update(
                 leagle_candidate_svd_rank=32,
@@ -278,7 +303,7 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
             kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
             if svd == "svd":
                 kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
-        if svd in ("quant", "svd_quant"):
+        if svd in ("quant", "svd_quant", "candidate_quant", "candidate_quant_direct"):
             kwargs["speculative_config"]["leagle_release_quantized_source"] = True
     if mode != "eager":
         kwargs["compilation_config"] = dict(
@@ -302,7 +327,10 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
 
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
 @pytest.mark.parametrize("tp", [1, 2])
-@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank", "quant", "svd_quant"])
+@pytest.mark.parametrize("candidate", [
+    False, True, "svd", "svd_lowrank", "quant", "svd_quant",
+    "candidate_quant", "candidate_quant_direct",
+])
 def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate, tp):
     if torch.npu.device_count() < tp:
         pytest.skip(f"Requires {tp} visible NPUs")
@@ -310,6 +338,9 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
     config = _architecture()
     if candidate is True:
         config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        config.update(candidate_head=True, candidate_head_rank=32, candidate_head_top_k=7,
+                      candidate_rerank=candidate != "candidate_quant_direct")
     target_config = Qwen3Config(**config["transformer_layer_config"])
     target_config.num_hidden_layers = 4
     target_config.layer_types = ["full_attention"] * 4
@@ -351,7 +382,7 @@ def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candi
                 str(target_path),
                 run_draft,
                 str(output),
-                candidate if candidate in ("svd", "svd_lowrank", "quant", "svd_quant") else "none",
+                candidate if isinstance(candidate, str) else "none",
                 str(tp),
             ],
             check=True,

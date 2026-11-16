@@ -66,12 +66,17 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     proposer.configure_lm_head_quantization()
     assert installed[-1] == (("int8", weight), {"release_source": True})
     proposer.model.svd_candidate_head = None
-    with pytest.raises(ValueError, match="requires SVD"):
-        proposer.configure_lm_head_quantization()
+    proposer.model.candidate_head = SimpleNamespace(up_proj=SimpleNamespace(weight=weight))
+    proposer.model.set_quantized_candidate_head = (
+        lambda head, **kwargs: installed.append(("candidate", head, kwargs))
+    )
+    proposer.configure_lm_head_quantization()
+    assert installed[-1] == ("candidate", ("int8", weight), {"release_source": True})
 
 
 @torch.inference_mode()
-def test_int8_head_preserves_source_and_matches_scaled_integer_reference():
+@pytest.mark.parametrize("width", [32, 640])
+def test_int8_head_preserves_source_and_matches_scaled_integer_reference(width):
     path = Path(__file__).resolve().parents[2] / "vllm_ascend/worker/v2/spec_decode/leagle_quant.py"
     spec = importlib.util.spec_from_file_location("leagle_quant_cpu_contract", path)
     module = importlib.util.module_from_spec(spec)
@@ -90,16 +95,16 @@ def test_int8_head_preserves_source_and_matches_scaled_integer_reference():
 
     ops = SimpleNamespace(npu_dynamic_quant=dynamic, npu_quant_matmul=matmul)
     # Exact integer-valued rows give an independent no-quantization-error case.
-    weight = torch.arange(64 * 32).reshape(64, 32).remainder(128).to(torch.bfloat16)
+    weight = torch.arange(64 * width).reshape(64, width).remainder(128).to(torch.bfloat16)
     weight[0].zero_()
     original = weight.clone()
     head = module.AscendLEagleInt8Head(weight, ops=ops)
-    assert head.weight_int8.shape == (32, 64)
+    assert head.weight_int8.shape == (width, 64)
     assert head.weight_int8.dtype == torch.int8
     assert head.weight_scale[0] == 1
     assert not head.state_dict() and not list(head.parameters())
     torch.testing.assert_close(weight, original)
-    hidden = torch.arange(64).reshape(2, 1, 32).to(torch.bfloat16)
+    hidden = torch.arange(2 * width).reshape(2, 1, width).to(torch.bfloat16)
     q, scale = dynamic(hidden.flatten(0, 1), torch.int8)
     expected = matmul(q, head.weight_int8, head.weight_scale, scale, torch.bfloat16)
     torch.testing.assert_close(head(hidden).view(2, 64), expected)

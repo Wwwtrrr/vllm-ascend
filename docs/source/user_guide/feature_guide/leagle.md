@@ -70,8 +70,8 @@ and [quantized matmul](https://github.com/Ascend/op-plugin/blob/master/docs/zh/c
 This is an Ascend LEAGLE implementation of the private low-precision proposal
 head idea, not a direct port of PR #59973's FP8/NVFP4 kernels. Initial support
 requires BF16, hidden/vocabulary shard sizes divisible by 32 and the LEAGLE
-greedy proposal restrictions. Without SVD, candidate scoring is rejected:
-set `leagle_use_candidate_head=false` when using a candidate checkpoint.
+greedy proposal restrictions. An enabled trained candidate head quantizes its
+own up-projection. Disable candidate scoring to quantize the full LM head.
 Default is disabled; use `None`/omit the option for the BF16 baseline.
 
 Weights are quantized in bounded FP32 chunks during model loading, and NZ
@@ -98,8 +98,8 @@ speculative_config = {
 The path is BF16 hidden-to-rank projection, W8A8 rank-to-vocabulary projection,
 TopK retrieval, then original BF16 candidate rescoring. Only the large SVD
 up-projection is quantized; rank and draft vocabulary must be multiples of 32.
-The original dense head and BF16 SVD factors remain resident. Trained candidate
-heads without inference SVD remain unsupported. Do not disable the candidate
+The original dense head and BF16 SVD factors remain resident by default.
+Trained candidate heads also support W8A8 as described below. Do not disable the candidate
 head with SVD enabled. For pure low-rank scoring, set rerank false and omit TopK.
 Both eager and FULL use the combined head, initialized before capture; changing
 scoring requires restart. Target and draft TP must match. Quantization can change candidate
@@ -110,7 +110,7 @@ tests include `svd_quant` eager/FULL serving and graph replay cases.
 To release unused BF16 source weights after successful quantization, add
 `"leagle_release_quantized_source": True` to the Python speculative config
 (use lowercase `true` in JSON). Default is false, preserving existing behavior.
-Full-head W8A8 releases the dense draft head. SVD W8A8 releases the BF16
+Full-head W8A8 releases the dense draft head. Candidate/SVD W8A8 releases the BF16
 up-projection; the dense original head stays for candidate reranking, and is
 released only when reranking is disabled. The BF16 SVD down-projection and
 target weights remain unchanged.
@@ -124,6 +124,42 @@ reusable. Restart to switch modes; no hot reload or BF16 fallback afterwards.
 The figures above are for TP=1; per-rank savings with TP follow the local shard
 size, approximately divided by TP with vocabulary padding overhead.
 Checkpoint files are not modified. Isolated benchmarks keep their BF16 baseline.
+
+### Trained candidate-r640 with W8A8
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/leagle-candidate-r640",
+    "num_speculative_tokens": 7,
+    "leagle_use_candidate_head": True,
+    "leagle_candidate_rerank": False,
+    "leagle_lm_head_quantization": "w8a8",
+    "leagle_release_quantized_source": True,
+}
+```
+
+Rank comes from the checkpoint's `candidate_head_rank`; no SVD rank is needed.
+Do not set `leagle_candidate_svd_rank`, which would select a newly derived SVD
+head. The trained down-projection stays BF16, while the trained rank-to-vocab
+up-projection uses the same native dynamic INT8 quantization and matmul as the
+other W8A8 paths. Direct scoring takes ArgMax of the resulting BF16 logits.
+For TopK/exact rescoring, use `leagle_candidate_rerank=True` and optionally set
+`leagle_candidate_top_k`. Omit TopK when rerank is false.
+
+Source release defaults to false. When enabled, it removes the BF16 trained
+up-projection after successful quantization; direct scoring also releases the
+unused dense draft head. Exact rescoring keeps that dense head. For vocab
+151936/rank 640, the up-projection source is about 185 MiB at TP=1; the dense
+head is about 742 MiB at hidden size 2560. These are freed source bytes, not
+total memory or peak-memory savings. With TP, each worker quantizes/releases
+its own vocabulary shard. No checkpoint conversion or retraining is required.
+Runtime scoring changes and weight reload require restart/recapture.
+
+The existing BF16/rank alignment constraints apply. Native tests cover trained
+candidate W8A8 with both rerank settings, source release, TP=1/2 eager/FULL, and
+width-640 INT8 graph replay. Hardware tests still require actual NPUs; evaluate
+real-checkpoint candidate recall, acceptance and TPOT before deployment.
 
 Run the isolated benchmark before serving:
 

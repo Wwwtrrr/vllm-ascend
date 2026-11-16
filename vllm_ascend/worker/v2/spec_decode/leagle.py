@@ -16,7 +16,7 @@ class AscendLEagleSpeculator(LEagleSpeculator):
         if mode is None:
             return
         if mode != "w8a8":
-            raise ValueError("Ascend LEAGLE only supports w8a8 full-head quantization")
+            raise ValueError("Ascend LEAGLE only supports w8a8 projection quantization")
         from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
 
         release = getattr(self.speculative_config, "leagle_release_quantized_source", False)
@@ -27,7 +27,11 @@ class AscendLEagleSpeculator(LEagleSpeculator):
             )
             return
         if self.model.candidate_head_enabled:
-            raise ValueError("LEAGLE W8A8 requires SVD for candidate scoring")
+            self.model.set_quantized_candidate_head(
+                AscendLEagleInt8Head(self.model.candidate_head.up_proj.weight),
+                release_source=release,
+            )
+            return
         self.model.set_quantized_lm_head(
             AscendLEagleInt8Head(self.model.lm_head.weight), release_source=release
         )
