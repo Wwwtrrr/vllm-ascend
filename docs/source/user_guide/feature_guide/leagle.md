@@ -35,27 +35,6 @@ framework's one-hot rejection path. Candidate retrieval can miss the dense best
 token; measure acceptance and TPOT on the real checkpoint. Hardware tests cover
 candidate eager/FULL output parity and replay counters but must be run on NPU.
 
-Dense checkpoints also support inference-only SVD initialization. Set
-`leagle_candidate_svd_rank=256` and `leagle_candidate_top_k=256` in the
-speculative config. No trained candidate weights or checkpoint edits are
-required: loaded LM-head weights generate CPU FP64 Gram/eigh factors, matching
-the training repository's SVD method. Factor buffers are nonpersistent and
-allocated on the model device before profiling and ACL capture. Replay only
-executes low-rank retrieval, Top-K and original-weight candidate rescoring.
-
-For direct low-rank logits without rescoring, set
-`leagle_candidate_rerank=false` and omit `leagle_candidate_top_k`. For dense
-comparison, remove `leagle_candidate_svd_rank` and set
-`leagle_use_candidate_head=false`. Restart between modes; do not hot-reload
-weights into an initialized SVD head. Both candidate and direct low-rank modes
-can change draft tokens and acceptance. Real NPU correctness and performance
-must be measured; CPU tests do not establish ACL or latency behavior.
-
-SVD does not require NPU FP64/eigh support. CPU decomposition can take time,
-with initialization start/end logs. The original dense head stays resident;
-factors add device memory and are recomputed at every startup, not cached on
-disk or added to saved checkpoints.
-
 ## INT8 full-vocabulary draft head
 
 Set `leagle_lm_head_quantization="w8a8"` in `speculative_config` to create a
@@ -81,43 +60,17 @@ allocated before profiling/capture. Both eager and FULL use the same operators;
 hot reload requires engine restart and recapture. No unsupported-kernel CPU
 fallback or automatic acceptance-preserving promise is made.
 
-SVD can be combined with W8A8 using:
-
-```python
-speculative_config = {
-    "method": "leagle",
-    "model": "/path/to/leagle/checkpoint",
-    "num_speculative_tokens": 7,
-    "leagle_candidate_svd_rank": 256,
-    "leagle_candidate_top_k": 128,
-    "leagle_candidate_rerank": True,
-    "leagle_lm_head_quantization": "w8a8",
-}
-```
-
-The path is BF16 hidden-to-rank projection, W8A8 rank-to-vocabulary projection,
-TopK retrieval, then original BF16 candidate rescoring. Only the large SVD
-up-projection is quantized; rank and draft vocabulary must be multiples of 32.
-The original dense head and BF16 SVD factors remain resident by default.
-Trained candidate heads also support W8A8 as described below. Do not disable the candidate
-head with SVD enabled. For pure low-rank scoring, set rerank false and omit TopK.
-Both eager and FULL use the combined head, initialized before capture; changing
-scoring requires restart. Target and draft TP must match. Quantization can change candidate
-recall and acceptance, and does not guarantee lower TPOT. Compare identical
-SVD/rank/TopK settings with and without W8A8 on actual NPU hardware. Native
-tests include `svd_quant` eager/FULL serving and graph replay cases.
-
 To release unused BF16 source weights after successful quantization, add
 `"leagle_release_quantized_source": True` to the Python speculative config
 (use lowercase `true` in JSON). Default is false, preserving existing behavior.
-Full-head W8A8 releases the dense draft head. Candidate/SVD W8A8 releases the BF16
+Full-head W8A8 releases the dense draft head. Candidate W8A8 releases the BF16
 up-projection; the dense original head stays for candidate reranking, and is
-released only when reranking is disabled. The BF16 SVD down-projection and
+released only when reranking is disabled. The BF16 trained down-projection and
 target weights remain unchanged.
 
-For vocabulary 151936, hidden 2560 and rank 256, this frees approximately
-742 MiB (full head), 74 MiB (SVD with reranking), or 816 MiB (SVD without
-reranking), relative to retaining both representations. Release occurs before
+For vocabulary 151936, hidden 2560 and trained rank 640, this frees about
+742 MiB (full head), 185 MiB (candidate reranking), or 927 MiB (direct candidate
+scoring), relative to retaining both representations. Release occurs before
 profiling/capture, does not reduce quantization-time peak memory, and does not
 guarantee avoiding OOM. Allocator-reserved storage may remain visible but is
 reusable. Restart to switch modes; no hot reload or BF16 fallback afterwards.
@@ -139,9 +92,8 @@ speculative_config = {
 }
 ```
 
-Rank comes from the checkpoint's `candidate_head_rank`; no SVD rank is needed.
-Do not set `leagle_candidate_svd_rank`, which would select a newly derived SVD
-head. The trained down-projection stays BF16, while the trained rank-to-vocab
+Rank comes from the checkpoint's `candidate_head_rank`. The trained
+down-projection stays BF16, while the trained rank-to-vocab
 up-projection uses the same native dynamic INT8 quantization and matmul as the
 other W8A8 paths. Direct scoring takes ArgMax of the resulting BF16 logits.
 For TopK/exact rescoring, use `leagle_candidate_rerank=True` and optionally set
@@ -274,10 +226,8 @@ context buffers retain the full hidden dimension.
 
 Attention/MLP row outputs use the framework TP reductions. Full/coarse logits
 are gathered before selection; TopK candidate IDs are broadcast from rank zero,
-and exact scores are reduced from the owning original-head shards. SVD builds
-the global FP64 Gram matrix over the TP CPU group and broadcasts the rank-zero
-basis. W8A8 quantizes each local vocabulary shard, including SVD up-projections;
-the opt-in source release flag continues to work. This does not gather BF16
+and exact scores are reduced from the owning original-head shards. W8A8 quantizes each local full-head or
+trained candidate up-projection shard; the opt-in source release flag continues to work. This does not gather BF16
 weight matrices on each draft step.
 
 PP/DCP/PCP must remain one, sequence parallel target features are rejected,
@@ -289,7 +239,7 @@ correctness, not native graph correctness or performance. Small-batch TP can
 be slower due to communication; compare acceptance and TPOT before deployment.
 
 The native serving tests below include TP=1 and TP=2 for dense, candidate,
-SVD, W8A8 and SVD+W8A8 paths. TP=2 cases skip without two visible NPUs. Run with
+W8A8 and trained candidate+W8A8 paths. TP=2 cases skip without two visible NPUs. Run with
 `ASCEND_RT_VISIBLE_DEVICES=0,1` to validate both workers' shard dimensions,
 proposal agreement and target/draft FULL replay counters.
 
@@ -312,3 +262,6 @@ They exercise native ACL replay with shrinking contexts, compare target-only,
 LEAGLE eager, FULL and FULL_DECODE_ONLY outputs, and assert that both target FULL
 and draft projection/rollout replay counters advance. Run a further acceptance
 and latency evaluation with the actual trained checkpoint before deployment.
+
+Inference-time decomposition has been removed. Delete the obsolete
+`leagle_candidate_svd_rank` option from existing launch configurations.

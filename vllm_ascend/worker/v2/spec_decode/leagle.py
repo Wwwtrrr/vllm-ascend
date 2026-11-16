@@ -20,12 +20,6 @@ class AscendLEagleSpeculator(LEagleSpeculator):
         from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
 
         release = getattr(self.speculative_config, "leagle_release_quantized_source", False)
-        if self.model.svd_candidate_head is not None:
-            self.model.set_quantized_svd_head(
-                AscendLEagleInt8Head(self.model.svd_candidate_head.up_weight),
-                release_source=release,
-            )
-            return
         if self.model.candidate_head_enabled:
             self.model.set_quantized_candidate_head(
                 AscendLEagleInt8Head(self.model.candidate_head.up_proj.weight),

@@ -96,7 +96,7 @@ def test_native_acl_graph_matches_eager_after_context_shrink():
 
 @torch.inference_mode()
 @pytest.mark.parametrize("candidate", [
-    False, True, "svd", "svd_lowrank", "quant", "svd_quant",
+    False, True, "quant",
     "candidate_quant", "candidate_quant_direct",
 ])
 def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
@@ -108,19 +108,6 @@ def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
         config.update(candidate_head=True, candidate_head_rank=32, candidate_head_top_k=7,
                       candidate_rerank=candidate != "candidate_quant_direct")
     model = _draft(config).to(device="npu", dtype=torch.bfloat16)
-    if candidate in ("svd", "svd_lowrank"):
-        model.configure_output_head(svd_rank=8, top_k=7 if candidate == "svd" else None, rerank=candidate == "svd")
-    if candidate == "svd_quant":
-        model.configure_output_head(svd_rank=32, top_k=7, rerank=True)
-        adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
-        adapter.model = model
-        adapter.speculative_config = SimpleNamespace(
-            leagle_lm_head_quantization="w8a8", leagle_release_quantized_source=True
-        )
-        adapter.configure_lm_head_quantization()
-        assert model.has_quantized_svd_head
-        assert model.lm_head is not None
-        assert model.svd_candidate_head.up_weight is None
     if candidate in ("candidate_quant", "candidate_quant_direct"):
         adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
         adapter.model = model
@@ -263,7 +250,7 @@ def _tp_state(worker):
     )
 
 
-def _serve(mode, target, draft, output_path, svd="none", tp="1"):
+def _serve(mode, target, draft, output_path, head_mode="none", tp="1"):
     # Worker subprocesses import the serving stack after selecting V2.
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
@@ -282,28 +269,17 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
     )
     if draft != "none":
         kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
-        if svd == "quant":
+        if head_mode == "quant":
             kwargs["speculative_config"]["leagle_lm_head_quantization"] = "w8a8"
-        elif svd in ("candidate_quant", "candidate_quant_direct"):
+        elif head_mode in ("candidate_quant", "candidate_quant_direct"):
             kwargs["speculative_config"].update(
                 leagle_use_candidate_head=True,
-                leagle_candidate_rerank=svd != "candidate_quant_direct",
+                leagle_candidate_rerank=head_mode != "candidate_quant_direct",
                 leagle_lm_head_quantization="w8a8",
             )
-            if svd == "candidate_quant":
+            if head_mode == "candidate_quant":
                 kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
-        elif svd == "svd_quant":
-            kwargs["speculative_config"].update(
-                leagle_candidate_svd_rank=32,
-                leagle_candidate_rerank=True,
-                leagle_candidate_top_k=7,
-                leagle_lm_head_quantization="w8a8",
-            )
-        elif svd != "none":
-            kwargs["speculative_config"].update(leagle_candidate_svd_rank=8, leagle_candidate_rerank=svd == "svd")
-            if svd == "svd":
-                kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
-        if svd in ("quant", "svd_quant", "candidate_quant", "candidate_quant_direct"):
+        if head_mode in ("quant",  "candidate_quant", "candidate_quant_direct"):
             kwargs["speculative_config"]["leagle_release_quantized_source"] = True
     if mode != "eager":
         kwargs["compilation_config"] = dict(
@@ -328,7 +304,7 @@ def _serve(mode, target, draft, output_path, svd="none", tp="1"):
 @pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
 @pytest.mark.parametrize("tp", [1, 2])
 @pytest.mark.parametrize("candidate", [
-    False, True, "svd", "svd_lowrank", "quant", "svd_quant",
+    False, True, "quant",
     "candidate_quant", "candidate_quant_direct",
 ])
 def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate, tp):

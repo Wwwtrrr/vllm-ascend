@@ -57,21 +57,22 @@ def test_leagle_dispatch_keeps_its_own_speculator(monkeypatch):
     proposer.speculative_config = SimpleNamespace(leagle_lm_head_quantization="w8a8")
     proposer.model = SimpleNamespace(
         candidate_head_enabled=True,
-        svd_candidate_head=SimpleNamespace(up_weight=weight),
-        set_quantized_svd_head=lambda head, **kwargs: installed.append((head, kwargs)),
+        candidate_head=SimpleNamespace(up_proj=SimpleNamespace(weight=weight)),
+        set_quantized_candidate_head=lambda head, **kwargs: installed.append((head, kwargs)),
     )
     proposer.configure_lm_head_quantization()
     assert installed == [(("int8", weight), {"release_source": False})]
     proposer.speculative_config.leagle_release_quantized_source = True
     proposer.configure_lm_head_quantization()
     assert installed[-1] == (("int8", weight), {"release_source": True})
-    proposer.model.svd_candidate_head = None
-    proposer.model.candidate_head = SimpleNamespace(up_proj=SimpleNamespace(weight=weight))
-    proposer.model.set_quantized_candidate_head = (
-        lambda head, **kwargs: installed.append(("candidate", head, kwargs))
+    proposer.model.candidate_head_enabled = False
+    proposer.model.lm_head = SimpleNamespace(weight=weight)
+    proposer.model.set_quantized_lm_head = (
+        lambda head, **kwargs: installed.append(("full", head, kwargs))
     )
     proposer.configure_lm_head_quantization()
-    assert installed[-1] == ("candidate", ("int8", weight), {"release_source": True})
+    assert installed[-1] == ("full", ("int8", weight), {"release_source": True})
+
 
 
 @torch.inference_mode()
