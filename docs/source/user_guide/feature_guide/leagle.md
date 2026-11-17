@@ -265,3 +265,25 @@ and latency evaluation with the actual trained checkpoint before deployment.
 
 Inference-time decomposition has been removed. Delete the obsolete
 `leagle_candidate_svd_rank` option from existing launch configurations.
+
+
+### Target decode input preparation graphs
+
+`leagle_target_input_graphs` defaults to `true`. With Ascend ModelRunner V2 and
+FULL graphs, the original startup-captured implementation packs request mapping,
+logits boundaries, query boundaries, prefill lengths and block counts into one
+stable metadata buffer. The graph prepares verification tokens, positions,
+sequence lengths, block tables and KV slots. CPU scheduling and the packed
+metadata upload remain outside the graph.
+
+Set `"leagle_target_input_graphs": false` in `speculative_config` and restart to
+compare with the original eager input preparation path. The temporary
+`VLLM_ASCEND_LEAGLE_INPUT_PREPARE_GRAPH` environment switch is no longer used.
+This does not change candidate rank, W8A8 or tensor parallelism.
+
+Capture occurs at startup for request counts up to `max_num_seqs`, adding graph
+memory and capture time. The captured path requires one KV group, decode-only
+queries, one bonus token per request and compatible padded request capacity.
+Prefill, PCP and adaptive verification use the existing input preparation path.
+Validate output parity, acceptance and latency on the deployment NPU before
+using benchmark results; local CPU checks cannot validate native ACL capture.

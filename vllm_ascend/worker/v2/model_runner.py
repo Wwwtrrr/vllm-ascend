@@ -280,6 +280,10 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
         super().load_model(load_dummy_weights, *args, **kwargs)
+        if self.speculative_config is not None and self.speculative_config.method == "leagle":
+            self.speculator.bind_target_input_graphs(
+                self.input_buffers, self.req_states, self.max_num_reqs, self.decode_query_len
+            )
         self.pd_dspark_aux_layer_ids = aux_layers
         # In cudagraph modes the dumper must be started before graph capture so
         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
@@ -803,8 +807,23 @@ class NPUModelRunner(GPUModelRunner):
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
         num_reqs = len(req_ids)
+        input_graph = getattr(self.speculator, "target_input_graph_runner", None)
+        if (
+            batch_desc.cg_mode != CUDAGraphMode.FULL
+            or self.pcp_manager is not None
+            or self.adaptive_verification is not None
+            or np.any(batch_req_state.num_computed_prefill_tokens_np < batch_req_state.prefill_len_np)
+            or self.model_state.num_new_sampled_tokens_per_step != 1
+        ):
+            input_graph = None
+        if input_graph is not None and not input_graph.ready():
+            raise RuntimeError("LEAGLE target input graph capture is incomplete")
+        idx_mapping = (
+            input_graph.state.idx[:num_reqs]
+            if input_graph is not None
+            else async_copy_to_gpu(idx_mapping_np, device=self.device)
+        )
 
         num_valid_tokens = num_scheduled_tokens_np
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -832,9 +851,15 @@ class NPUModelRunner(GPUModelRunner):
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            cu_num_logits = (
+                input_graph.state.cu[: num_reqs + 1]
+                if input_graph is not None
+                else torch.arange(num_reqs + 1, device=self.device, dtype=torch.int32)
+            )
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            expanded_local_pos = (
+                None if input_graph is not None else torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            )
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -848,7 +873,11 @@ class NPUModelRunner(GPUModelRunner):
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = (
+                input_graph.state.cu[: num_reqs + 1]
+                if input_graph is not None
+                else async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            )
 
         adaptive_verification_manager = self.adaptive_verification
         adaptive_verification_active = (
@@ -884,7 +913,17 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         query_start_loc = self.input_buffers.query_start_loc
-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+        if input_graph is not None and num_reqs_padded > self.max_num_reqs:
+            input_graph = None
+            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            if not draft_tokens:
+                expanded_idx_mapping = idx_mapping
+                expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+        if input_graph is not None:
+            input_graph.state.stage(idx_mapping_np, cu_num_logits_np, query_start_loc_np)
+        else:
+            async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
         if adaptive_verification_active:
             cu_num_logits, query_start_loc, total_num_draft_tokens = adaptive_verification_manager.reallocate_drafts(
@@ -909,7 +948,7 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc = self.input_buffers.query_start_loc
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
-        if draft_tokens:
+        if draft_tokens and input_graph is None:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
@@ -934,13 +973,16 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
-        )
+        if input_graph is not None:
+            expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(num_reqs, total_num_logits)
+        else:
+            prepare_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+            )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
@@ -954,18 +996,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        if input_graph is None:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.
@@ -1029,10 +1072,24 @@ class NPUModelRunner(GPUModelRunner):
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
 
+        if input_graph is not None:
+            self._leagle_prepared_attn = (input_batch, input_graph.prepared_attn)
+
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
 
         return input_batch
+
+    def prepare_attn(self, input_batch):
+        prepared = getattr(self, "_leagle_prepared_attn", None)
+        self._leagle_prepared_attn = None
+        if prepared is not None and prepared[0] is input_batch and prepared[1] is not None:
+            tables, mappings = prepared[1]
+            return (
+                tuple(table[: input_batch.num_reqs_after_padding] for table in tables),
+                mappings[:, : input_batch.num_tokens_after_padding],
+            )
+        return super().prepare_attn(input_batch)
 
     def prepare_inputs(
         self,
