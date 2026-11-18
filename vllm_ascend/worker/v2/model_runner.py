@@ -803,13 +803,15 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = batch_req_state.req_ids
 
+        self._update_seq_lens_cpu(scheduler_output, req_ids)
+
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
         num_reqs = len(req_ids)
         input_graph = getattr(self.speculator, "target_input_graph_runner", None)
         merged_prefix = getattr(self.cudagraph_manager, "leagle_input_prefix", None)
         if merged_prefix is not None:
-            merged_prefix.pending = 0
+            merged_prefix.pending = False
         use_merged_prefix = False
         if (
             batch_desc.cg_mode != CUDAGraphMode.FULL
@@ -821,12 +823,6 @@ class NPUModelRunner(GPUModelRunner):
             input_graph = None
         if input_graph is not None and not input_graph.ready():
             raise RuntimeError("LEAGLE target input graph capture is incomplete")
-        # LEAGLE input preparation reads corrected lengths on device. Stage
-        # and submit it before waiting for the CPU mirror needed by attention.
-        # Keep adaptive verification/PCP on their existing ordering.
-        defer_cpu_lengths = input_graph is not None
-        if not defer_cpu_lengths:
-            self._update_seq_lens_cpu(scheduler_output, req_ids)
         idx_mapping = (
             input_graph.state.idx[:num_reqs]
             if input_graph is not None
@@ -842,15 +838,14 @@ class NPUModelRunner(GPUModelRunner):
                 ],
                 dtype=np.int32,
             )
-        if not defer_cpu_lengths:
-            attn_state = build_attn_state(
-                self.vllm_config,
-                self.input_buffers.seq_lens_np,
-                num_reqs,
-                num_scheduled_tokens_np,
-                num_valid_tokens,
-                kv_cache_config=self.kv_cache_config,
-            )
+        attn_state = build_attn_state(
+            self.vllm_config,
+            self.input_buffers.seq_lens_np,
+            num_reqs,
+            num_scheduled_tokens_np,
+            num_valid_tokens,
+            kv_cache_config=self.kv_cache_config,
+        )
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -934,19 +929,15 @@ class NPUModelRunner(GPUModelRunner):
             use_merged_prefix = (
                 merged_prefix is not None
                 and merged_prefix.captured
-                and num_reqs <= num_reqs_padded <= self.max_num_reqs
-                and num_tokens == total_num_logits
-                # Keep FIA's padded rows inside the persistent buffers. An
-                # extra synthetic row would copy stale block tables before
-                # the target prefix has run.
-                and query_start_loc_np[num_reqs_padded] == num_tokens_after_padding
+                and num_reqs == num_reqs_padded == 1
+                and num_tokens == num_tokens_after_padding == total_num_logits
                 and batch_desc.num_ubatches == 1
             )
             if use_merged_prefix:
                 # Views are consumed after target forward. CPU attention
                 # metadata uses exact CPU lengths and aliases the KV buffers.
                 expanded_idx_mapping, expanded_local_pos, logits_indices = merged_prefix.outputs(total_num_logits)
-                merged_prefix.pending = num_reqs
+                merged_prefix.pending = True
             else:
                 # Submit early so CPU metadata work can overlap preparation.
                 expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(
@@ -1014,17 +1005,6 @@ class NPUModelRunner(GPUModelRunner):
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
-
-        if defer_cpu_lengths:
-            self._update_seq_lens_cpu(scheduler_output, req_ids)
-            attn_state = build_attn_state(
-                self.vllm_config,
-                self.input_buffers.seq_lens_np,
-                num_reqs,
-                num_scheduled_tokens_np,
-                num_valid_tokens,
-                kv_cache_config=self.kv_cache_config,
-            )
 
         # Pad for full CUDA graph mode.
         self.input_buffers.seq_lens_np[num_reqs:] = 0
@@ -1117,12 +1097,8 @@ class NPUModelRunner(GPUModelRunner):
         elif input_graph is not None:
             self._leagle_prepared_attn = (input_batch, input_graph.prepared_attn)
 
-        # Every FULL graph captured with this wrapper already includes RoPE,
-        # including its disabled-prefix fallback. Avoid doing it twice.
-        rope_in_target_graph = (
-            merged_prefix is not None and merged_prefix.captured and batch_desc.cg_mode == CUDAGraphMode.FULL
-        )
-        if not rope_in_target_graph:
+        # Merged target graphs update RoPE after producing the new positions.
+        if not use_merged_prefix:
             update_cos_sin(input_batch.positions)
 
         return input_batch
@@ -1397,30 +1373,25 @@ class NPUModelRunner(GPUModelRunner):
         req_ids: list[str],
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-        cached_req_ids = scheduler_output.scheduled_cached_reqs.req_ids
 
         # Speculative decoding needs corrected num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if cached_req_ids and (
-            (self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config))
-            or self.sync_spec_pp_cpu_counts
-        ):
+        if (
+            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+        ) or self.sync_spec_pp_cpu_counts:
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
-            corrected = self.num_computed_tokens_cpu.numpy()
-            host_counts = self.req_states.num_computed_tokens_cpu.numpy()
-            for req_id in cached_req_ids:
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 req_index = self.req_states.req_id_to_index[req_id]
-                host_counts[req_index] = corrected[req_index]
+                self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
 
-        # NumPy views share the authoritative CPU tensors. Avoid constructing
-        # torch scalar tensors for every request and every integer addition.
-        host_counts = self.req_states.num_computed_tokens_cpu.numpy()
-        seq_lens = self.input_buffers.seq_lens_np
-        for i, req_id in enumerate(req_ids):
+        # Without a CPU consumer, retain the upstream optimistic upper bound.
+        # prepare_pos_seq_lens still reads exact rejection-corrected NPU state.
+        for i, req_id in enumerate(req_ids):  # type: ignore
             req_index = self.req_states.req_id_to_index[req_id]
-            seq_lens[i] = host_counts[req_index] + num_scheduled_tokens[req_id]
+            num_computed_tokens = self.req_states.num_computed_tokens_cpu[req_index]
+            self.input_buffers.seq_lens_cpu[i] = num_computed_tokens + num_scheduled_tokens[req_id]
 
     def _pad_query_start_loc_for_fia(
         self,

@@ -184,7 +184,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             prefix.set_enabled(prefix.pending)
             if prefix.pending:
                 prefix.replays += 1
-            prefix.pending = 0
+            prefix.pending = False
         num_tokens = desc.num_tokens
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):
@@ -354,7 +354,7 @@ class ModelWithContext(nn.Module):
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
             if self.input_prefix is not None and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
-                self.input_prefix.forward(kwargs["positions"].shape[0])
+                self.input_prefix.forward()
                 # RoPE preparation reads positions, so it must follow the
                 # prefix in the same graph, before the model consumes it.
                 from vllm_ascend.ops.rotary_embedding import update_cos_sin
