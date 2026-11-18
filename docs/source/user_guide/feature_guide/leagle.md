@@ -270,11 +270,29 @@ Inference-time decomposition has been removed. Delete the obsolete
 ### Target decode input preparation graphs
 
 `leagle_target_input_graphs` defaults to `true`. With Ascend ModelRunner V2 and
-FULL graphs, the original startup-captured implementation packs request mapping,
+FULL graphs, the startup-captured implementation packs request mapping,
 logits boundaries, query boundaries, prefill lengths and block counts into one
 stable metadata buffer. The graph prepares verification tokens, positions,
 sequence lengths, block tables and KV slots. CPU scheduling and the packed
 metadata upload remain outside the graph.
+
+Unchanged metadata reuses the previous device upload. The comparison includes
+request slots, logits/query boundaries (including padding), prefill lengths and
+KV block counts. Positions and sampled/draft tokens remain live device inputs
+and are consumed again on every replay. Changing acceptance lengths, request
+slots or KV allocation therefore updates the metadata when needed.
+
+On NPU platforms with pinned-memory support, changed metadata uses two reusable
+host staging slots. Each slot is protected by its H2D completion event; when both
+are busy, the code falls back to an independently owned upload without adding a
+CPU wait. Single-request validation avoids temporary difference arrays. Replay
+is submitted immediately after staging, before the remaining CPU metadata work.
+
+For diagnostics, `target_input_graph_state` on the worker speculator exposes
+`metadata_uploads`, `metadata_reuses` and `staging_fallbacks`. These counters
+include startup capture; compare differences over a warmed-up workload. This
+optimization does not remove the existing CPU wait for rejection-corrected
+sequence lengths in `_update_seq_lens_cpu`; that wait can still dominate ITL.
 
 Set `"leagle_target_input_graphs": false` in `speculative_config` and restart to
 compare with the original eager input preparation path. The temporary

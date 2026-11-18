@@ -922,6 +922,9 @@ class NPUModelRunner(GPUModelRunner):
                 expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
         if input_graph is not None:
             input_graph.state.stage(idx_mapping_np, cu_num_logits_np, query_start_loc_np)
+            # Decode-only guard above guarantees no prefill writes are needed.
+            # Submit now so the remaining CPU metadata work can overlap replay.
+            expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(num_reqs, total_num_logits)
         else:
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
@@ -973,9 +976,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         # Prepare positions and seq_lens.
-        if input_graph is not None:
-            expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(num_reqs, total_num_logits)
-        else:
+        if input_graph is None:
             prepare_pos_seq_lens(
                 idx_mapping,
                 query_start_loc,
