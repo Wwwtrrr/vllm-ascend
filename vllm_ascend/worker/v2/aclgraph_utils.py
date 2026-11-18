@@ -165,6 +165,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.leagle_input_prefix = None
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
@@ -176,6 +177,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        prefix = self.leagle_input_prefix
+        if prefix is not None:
+            # Dummy and prefill executions may reuse the same captured target.
+            # Consume the per-batch marker, never reuse a previous decode flag.
+            prefix.set_enabled(prefix.pending)
+            if prefix.pending:
+                prefix.replays += 1
+            prefix.pending = False
         num_tokens = desc.num_tokens
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):
@@ -274,7 +283,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        model = ModelWithContext(model, device_metadata=metadata)
+        self.leagle_input_prefix = None
+        if getattr(self.model_runner.speculative_config, "leagle_merge_target_input_graph", False):
+            from vllm_ascend.worker.v2.spec_decode.leagle_target_prefix import make_target_prefix
+
+            self.leagle_input_prefix = make_target_prefix(self.model_runner)
+        model = ModelWithContext(model, device_metadata=metadata, input_prefix=self.leagle_input_prefix)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:
             cudagraph_utils.prepare_inputs_to_capture = partial(
@@ -308,12 +322,20 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
+    def __init__(
+        self,
+        original_model,
+        is_draft_model=False,
+        is_draft_model_prefill=False,
+        device_metadata=None,
+        input_prefix=None,
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
+        self.input_prefix = input_prefix
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -331,6 +353,15 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
+            if self.input_prefix is not None and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                self.input_prefix.forward()
+                # RoPE preparation reads positions, so it must follow the
+                # prefix in the same graph, before the model consumes it.
+                from vllm_ascend.ops.rotary_embedding import update_cos_sin
+
+                update_cos_sin(kwargs["positions"])
+                if torch.npu.is_current_stream_capturing():
+                    self.input_prefix.captured = True
             return self.original_model(*args, **kwargs)
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.

@@ -809,6 +809,10 @@ class NPUModelRunner(GPUModelRunner):
         idx_mapping_np = batch_req_state.idx_mapping_np
         num_reqs = len(req_ids)
         input_graph = getattr(self.speculator, "target_input_graph_runner", None)
+        merged_prefix = getattr(self.cudagraph_manager, "leagle_input_prefix", None)
+        if merged_prefix is not None:
+            merged_prefix.pending = False
+        use_merged_prefix = False
         if (
             batch_desc.cg_mode != CUDAGraphMode.FULL
             or self.pcp_manager is not None
@@ -922,9 +926,23 @@ class NPUModelRunner(GPUModelRunner):
                 expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
         if input_graph is not None:
             input_graph.state.stage(idx_mapping_np, cu_num_logits_np, query_start_loc_np)
-            # Decode-only guard above guarantees no prefill writes are needed.
-            # Submit now so the remaining CPU metadata work can overlap replay.
-            expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(num_reqs, total_num_logits)
+            use_merged_prefix = (
+                merged_prefix is not None
+                and merged_prefix.captured
+                and num_reqs == num_reqs_padded == 1
+                and num_tokens == num_tokens_after_padding == total_num_logits
+                and batch_desc.num_ubatches == 1
+            )
+            if use_merged_prefix:
+                # Views are consumed after target forward. CPU attention
+                # metadata uses exact CPU lengths and aliases the KV buffers.
+                expanded_idx_mapping, expanded_local_pos, logits_indices = merged_prefix.outputs(total_num_logits)
+                merged_prefix.pending = True
+            else:
+                # Submit early so CPU metadata work can overlap preparation.
+                expanded_idx_mapping, expanded_local_pos, logits_indices = input_graph.replay(
+                    num_reqs, total_num_logits
+                )
         else:
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
@@ -1073,11 +1091,15 @@ class NPUModelRunner(GPUModelRunner):
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
 
-        if input_graph is not None:
+        if use_merged_prefix:
+            tables = self.block_tables
+            self._leagle_prepared_attn = (input_batch, (tuple(tables.input_block_tables), tables.slot_mappings))
+        elif input_graph is not None:
             self._leagle_prepared_attn = (input_batch, input_graph.prepared_attn)
 
-        # For mla/sfa, update cos/sin. Here is for execute_model.
-        update_cos_sin(input_batch.positions)
+        # Merged target graphs update RoPE after producing the new positions.
+        if not use_merged_prefix:
+            update_cos_sin(input_batch.positions)
 
         return input_batch
 

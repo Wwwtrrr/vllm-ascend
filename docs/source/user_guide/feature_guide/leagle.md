@@ -305,3 +305,39 @@ queries, one bonus token per request and compatible padded request capacity.
 Prefill, PCP and adaptive verification use the existing input preparation path.
 Validate output parity, acceptance and latency on the deployment NPU before
 using benchmark results; local CPU checks cannot validate native ACL capture.
+
+### Experimental merged target graph
+
+The opt-in `leagle_merge_target_input_graph` captures input preparation as a
+prefix of the target FULL graph, followed by RoPE preparation and target forward.
+Eligible steps skip the separate input-preparation graph replay:
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/draft",
+    "num_speculative_tokens": 7,
+    "leagle_target_input_graphs": True,
+    "leagle_merge_target_input_graph": True,
+}
+# LLM: max_num_seqs=1, tensor_parallel_size=1, V2 runner, FULL decode.
+# Capture size 8 covers one anchor plus seven draft tokens without padding.
+```
+
+The default is `False`. This first implementation requires a Qwen3 target,
+`max_num_seqs=1`, TP/PP/DP/PCP/DCP sizes of one, one KV group and the ordinary
+Ascend attention backend. LoRA, multimodal inputs and sparse offload are excluded.
+Only pure decode steps whose actual token count exactly matches the captured
+token count use the prefix. Prefill, padded steps and unsupported layouts retain
+the existing path. A device flag prevents the captured prefix from overwriting
+inputs on prefill/dummy replays; enabling this feature adds a disabled prefix
+kernel and in-graph RoPE preparation to those FULL fallback replays as well.
+
+Inspect `worker.model_runner.cudagraph_manager.leagle_input_prefix.replays`
+(when the prefix exists) to check whether the merged path was selected.
+For a controlled comparison, keep `leagle_target_input_graphs=True` and toggle
+only `leagle_merge_target_input_graph`, restarting between runs. Compare output
+tokens and acceptance statistics before measuring TPOT/ITL without profiling.
+The CPU wait for corrected sequence lengths, CPU attention metadata construction
+and attention task parameter updates remain outside the graph. Native Triton
+compilation, ACL replay correctness and latency require deployment-NPU testing.
