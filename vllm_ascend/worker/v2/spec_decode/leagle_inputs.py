@@ -47,6 +47,7 @@ class LEagleTargetInputState:
         self._host_blocks = self._packed[-max_requests:]
         self._cached_count = None
         self._cached_has_blocks = False
+        self._single_key = None
         self.metadata_uploads = 0
         self.metadata_reuses = 0
         self.staging_fallbacks = 0
@@ -92,15 +93,34 @@ class LEagleTargetInputState:
             if self.block_tables.num_kv_cache_groups != 1:
                 raise ValueError("LEAGLE input graphs require one KV-cache group")
             blocks = self.block_tables.num_blocks.np[0]
-        if (
-            self._cached_count == count
-            and self._cached_has_blocks == (blocks is not None)
-            and np.array_equal(slots, self._host_idx[:count])
-            and np.array_equal(cu_logits, self._host_cu[: count + 1])
-            and np.array_equal(query, self._host_query)
-            and np.array_equal(prefill, self._host_prefill)
-            and (blocks is None or np.array_equal(blocks, self._host_blocks))
-        ):
+        single_key = None
+        if self.max_requests == count == 1 and cu_logits.shape == (2,) and query.shape == (3,):
+            # Nine CPU integers describe the common BS1 layout. Avoid five
+            # NumPy reductions and temporary boolean arrays on every hit.
+            single_key = (
+                int(slots[0]),
+                int(cu_logits[0]),
+                int(cu_logits[1]),
+                int(query[0]),
+                int(query[1]),
+                int(query[2]),
+                int(prefill[0]),
+                blocks is not None,
+                int(blocks[0]) if blocks is not None else 0,
+            )
+        unchanged = self._cached_count == count and self._cached_has_blocks == (blocks is not None)
+        if unchanged:
+            if single_key is not None:
+                unchanged = single_key == self._single_key
+            else:
+                unchanged = (
+                    np.array_equal(slots, self._host_idx[:count])
+                    and np.array_equal(cu_logits, self._host_cu[: count + 1])
+                    and np.array_equal(query, self._host_query)
+                    and np.array_equal(prefill, self._host_prefill)
+                    and (blocks is None or np.array_equal(blocks, self._host_blocks))
+                )
+        if unchanged:
             # Only metadata is reused. Replay still reads the latest sampled
             # token, draft tokens and rejection-corrected positions on device.
             self.metadata_reuses += 1
@@ -140,6 +160,7 @@ class LEagleTargetInputState:
         self._upload_metadata()
         self._cached_has_blocks = blocks is not None
         self._cached_count = count
+        self._single_key = single_key
         self.metadata_uploads += 1
         self.staged = (count, int(cu_logits[-1]))
 

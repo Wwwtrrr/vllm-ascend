@@ -285,14 +285,26 @@ slots or KV allocation therefore updates the metadata when needed.
 On NPU platforms with pinned-memory support, changed metadata uses two reusable
 host staging slots. Each slot is protected by its H2D completion event; when both
 are busy, the code falls back to an independently owned upload without adding a
-CPU wait. Single-request validation avoids temporary difference arrays. Replay
-is submitted immediately after staging, before the remaining CPU metadata work.
+CPU wait. With `max_num_seqs=1`, a complete scalar metadata signature avoids
+repeated NumPy array comparisons on cache hits; validation on misses still
+checks request slots and query/logits boundaries. Replay is submitted immediately
+after staging, before the remaining CPU metadata work.
+
+For eligible decode steps, input preparation is staged (and the separate input
+graph is submitted when selected) before waiting for rejection-corrected CPU
+lengths. This permits overlap with the CPU wait without reading stale CPU data.
+Attention metadata is still built after that wait. CPU length updates use shared
+NumPy views instead of per-request torch scalar operations. Batches containing
+only new requests skip the wait because they do not consume the previous D2H
+lengths. Prefill, PCP and adaptive verification retain their preparation order.
 
 For diagnostics, `target_input_graph_state` on the worker speculator exposes
 `metadata_uploads`, `metadata_reuses` and `staging_fallbacks`. These counters
 include startup capture; compare differences over a warmed-up workload. This
-optimization does not remove the existing CPU wait for rejection-corrected
-sequence lengths in `_update_seq_lens_cpu`; that wait can still dominate ITL.
+optimization retains the required CPU wait for rejection-corrected sequence
+lengths of cached requests in `_update_seq_lens_cpu`; that wait can still dominate
+ITL. The merged path stages inputs early but executes its preparation kernel
+inside the target graph, after CPU attention metadata is ready.
 
 Set `"leagle_target_input_graphs": false` in `speculative_config` and restart to
 compare with the original eager input preparation path. The temporary
@@ -320,18 +332,40 @@ speculative_config = {
     "leagle_target_input_graphs": True,
     "leagle_merge_target_input_graph": True,
 }
-# LLM: max_num_seqs=1, tensor_parallel_size=1, V2 runner, FULL decode.
-# Capture size 8 covers one anchor plus seven draft tokens without padding.
+# LLM: V2 runner, FULL decode. max_num_seqs and TP may exceed one.
+# Seven draft tokens plus one anchor need 8 tokens per real request.
+# For example, capture size 128 covers 16 such requests.
 ```
 
-The default is `False`. This first implementation requires a Qwen3 target,
-`max_num_seqs=1`, TP/PP/DP/PCP/DCP sizes of one, one KV group and the ordinary
-Ascend attention backend. LoRA, multimodal inputs and sparse offload are excluded.
-Only pure decode steps whose actual token count exactly matches the captured
-token count use the prefix. Prefill, padded steps and unsupported layouts retain
-the existing path. A device flag prevents the captured prefix from overwriting
-inputs on prefill/dummy replays; enabling this feature adds a disabled prefix
+The default is `False`. The prefix supports batched decode, changing request
+counts/order and per-request draft lengths, as well as TP and DP workers. It uses
+each worker's local request state and KV tables without introducing collectives.
+The ordinary target/draft TP compatibility requirements still apply.
+
+The prefix checks the standard `AscendModelState` and `AscendAttentionBackend`
+instead of a target architecture name. This does not add support for new target
+models to LEAGLE itself. PP/PCP/DCP must remain one, with one KV group. LoRA,
+multimodal/prompt-embedding inputs, special position preparation, Engram,
+R-SWA, KV transfer/offload, KVPP, parallel drafting, adaptive verification and
+nonstandard model states/backends retain the existing preparation path.
+
+Token and request padding are supported when the padded request count fits the
+persistent buffers and the last query boundary matches the captured token size.
+Padding tokens/positions are initialized, padded block rows and sequence lengths
+are cleared, and unused KV slots are set to `-1`. If FIA needs a synthetic row
+beyond `max_num_seqs`, preparation falls back rather than copying an unfinished
+block table before the target graph runs. Prefill and unsupported layouts also
+retain the existing path. A device request count (zero means disabled) prevents
+the captured prefix from overwriting inputs on prefill/dummy replays, including
+idle DP workers; enabling this feature adds a disabled prefix
 kernel and in-graph RoPE preparation to those FULL fallback replays as well.
+Normal FULL execution skips the corresponding graph-external RoPE calculation,
+including fallback steps, so it is not duplicated. NONE/PIECEWISE execution
+retains graph-external RoPE preparation.
+
+The prefix prepares disjoint buffer tiles in parallel, including unused KV-slot
+cleanup, instead of serially walking the full capacity in a single program.
+This preserves the existing tail cleanup and block-table semantics.
 
 Inspect `worker.model_runner.cudagraph_manager.leagle_input_prefix.replays`
 (when the prefix exists) to check whether the merged path was selected.
