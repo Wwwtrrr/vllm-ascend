@@ -95,8 +95,6 @@ class HardwareCapability(Enum):
     # Enable the FP8/C8 attention KV-cache ABI and matching attention preprocess paths.
     # This is not a general statement that every FP8 operation is supported.
     FP8_ATTENTION = auto()
-    # Support the optional flash_attn_npu_3 device-length and tiling ABI.
-    FLASH_ATTN_NPU_3 = auto()
     # Select the compatibility grouped-top-k router used by the fused-MoE path.
     FUSED_MOE_COMPATIBILITY = auto()
     # Use npu_rotary_mul with adjacent pairs (rotary_mode="interleave").
@@ -307,8 +305,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             weight_layout_policy=WeightLayoutPolicy.CONFIGURABLE,
             moe_comm_policy=MoECommPolicy.CAPACITY_AND_EXPERT_DENSITY,
             quantization_backend_family=QuantizationBackendFamily.STANDARD,
-            capabilities=_STANDARD_CAPABILITIES
-            | {HardwareCapability.FLASH_ATTN_NPU_3, HardwareCapability.NPU_TOP_K_TOP_P},
+            capabilities=_STANDARD_CAPABILITIES | {HardwareCapability.NPU_TOP_K_TOP_P},
         ),
         AscendDeviceType.A3: HardwareProfile(
             _device_type=AscendDeviceType.A3,
@@ -324,7 +321,6 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
             capabilities=_A3_CAPABILITIES
             | {
                 HardwareCapability.CANN_MEGAMOE,
-                HardwareCapability.FLASH_ATTN_NPU_3,
                 HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
                 HardwareCapability.NPU_TOP_K_TOP_P,
             },

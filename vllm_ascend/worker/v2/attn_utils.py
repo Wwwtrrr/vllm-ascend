@@ -63,7 +63,6 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
-from vllm_ascend.attention.leagle_fa3 import AscendLEagleFA3Backend
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     MLA_FLASH_SUPPORTED_Q_HEADS,
@@ -557,12 +556,7 @@ def build_attn_metadata(
                 if not for_cudagraph_capture and model_specific_attn_metadata is not None
                 else {}
             )
-            if attn_group.backend is AscendLEagleFA3Backend:
-                attn_metadata_extra_kwargs.update(
-                    num_actual_reqs=num_actual_reqs,
-                    full_graph_mode=full_graph_mode or for_cudagraph_capture,
-                )
-            elif is_dsa_builder:
+            if is_dsa_builder:
                 # DSA cache groups share request-level metadata during replay.
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,

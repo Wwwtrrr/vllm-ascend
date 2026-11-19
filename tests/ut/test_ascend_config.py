@@ -1940,13 +1940,6 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_leagle_target_device_fa3_is_accepted_from_additional_config(self, mock_fix):
-        vc = VllmConfig(additional_config={"leagle_target_device_fa3": True})
-        self.assertTrue(init_ascend_config(vc).leagle_target_device_fa3)
-        self.assertIs(vc.additional_config["leagle_target_device_fa3"], True)
-
-    @_clean_up
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_sparse_kv_offload_string_false_survives_factory(self, mock_fix):
         vc = VllmConfig()
         vc.additional_config = {"sparse_kv_offload_config": {"enabled": "false"}}
