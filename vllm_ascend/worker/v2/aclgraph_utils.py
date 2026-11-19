@@ -176,6 +176,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        if getattr(self.model_runner, "_leagle_target_device_lengths", False):
+            # Every target layer consumes persistent device metadata staged by
+            # the builder on the replay stream. There are no FIA tasks to rebind.
+            return super().run_fullgraph(desc)
         num_tokens = desc.num_tokens
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):

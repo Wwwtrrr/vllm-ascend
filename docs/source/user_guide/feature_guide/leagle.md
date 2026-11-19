@@ -265,3 +265,25 @@ and latency evaluation with the actual trained checkpoint before deployment.
 
 Inference-time decomposition has been removed. Delete the obsolete
 `leagle_candidate_svd_rank` option from existing launch configurations.
+
+### Device-side target attention lengths
+
+On Ascend A2/A3, Model Runner V2 can run dense Qwen3 target attention with the
+device lengths produced after speculative rejection. Set
+`additional_config={"leagle_target_device_fa3": True}` on `LLM` (or pass
+`--additional-config '{"leagle_target_device_fa3":true}'` to `vllm serve`). Use
+`cudagraph_mode="FULL"`, 128-token KV blocks, and FP16/BF16 attention with
+matching unquantized KV cache. Restart the engine when changing the option.
+
+The optional `flash_attn_npu` installation must expose
+`flash_attn_npu_3.get_scheduler_metadata` and
+`flash_attn_npu_3.flash_attn_with_kvcache`. This is the device tiling API used in
+[vllm-ascend #21444](https://github.com/vllm-project/vllm-ascend/pull/21444).
+Unsupported environments use the existing backend. Check the worker log for
+`LEAGLE target FA3 uses device sequence lengths` to confirm activation.
+
+This path keeps the runner's exact sequence lengths on the NPU and bypasses
+their CPU snapshot and event wait. FULL replay reads persistent device tiling
+and skips FIA parameter updates. Target input preparation still runs before the
+model graph. Validate output and acceptance on the deployed stack, then compare
+steady-state latency with the option off and on.

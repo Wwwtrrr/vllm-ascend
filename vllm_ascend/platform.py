@@ -79,6 +79,9 @@ logger.info_once(
 )
 
 _CUSTOM_OP_REGISTERED = False
+_LEAGLE_FA3_OPTION = "leagle_target_device_fa3"
+_LEAGLE_FA3_BLOCK_SIZE = 128
+_LEAGLE_FA3_CACHE_LAYOUTS = (None, "NHD", "LBNHC")
 _MINIMAX_M3_ARCHITECTURES = frozenset(
     {
         "MiniMaxM3SparseForCausalLM",
@@ -245,12 +248,22 @@ class NPUPlatform(Platform):
         return total_memory
 
     @classmethod
+    def is_attention_backend_selection_cacheable(cls, vllm_config: VllmConfig) -> bool:
+        # The LEAGLE opt-in depends on the active config and target model tag,
+        # which are not part of the normal per-layer attention selector key.
+        additional = vllm_config.additional_config
+        return not isinstance(additional, dict) or additional.get(_LEAGLE_FA3_OPTION, False) is False
+
+    @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
         use_compress = getattr(attn_selector_config, "use_compress", False)
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
+
+        if _validate_leagle_device_fa3(backend_key, attn_selector_config, selected_backend):
+            return "vllm_ascend.attention.leagle_fa3.AscendLEagleFA3Backend"
 
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
@@ -1563,6 +1576,125 @@ def _disable_expandable_segments() -> None:
     if updated_configs != npu_alloc_configs:
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = updated_configs
         logger.info("Removed expandable_segments from PYTORCH_NPU_ALLOC_CONF: %s", updated_configs)
+
+
+def _validate_leagle_device_fa3(backend_key, selector, selected_backend) -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+
+    additional = config.additional_config
+    if not isinstance(additional, dict):
+        return False
+    enabled = additional.get(_LEAGLE_FA3_OPTION, False)
+    if type(enabled) is not bool:
+        raise TypeError(f"additional_config.{_LEAGLE_FA3_OPTION} must be a boolean.")
+    if not enabled:
+        return False
+
+    # Attention selection runs during model construction, which can also be
+    # entered in the draft loader's model scope.
+    from vllm.compilation import backends
+
+    if backends.model_tag != "backbone":
+        return False
+
+    reason = _leagle_device_fa3_unsupported_reason(config, backend_key, selector, selected_backend)
+    if reason is not None:
+        logger.warning_once("LEAGLE target device FA3 was not selected: %s. Using the existing backend.", reason)
+        return False
+
+    logger.info_once("Using device-length FA3 for LEAGLE target attention.")
+    return True
+
+
+def _leagle_device_fa3_unsupported_reason(config, backend_key, selector, selected_backend) -> str | None:
+    # Lazy imports avoid a platform/config import cycle.
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import AttentionType
+
+    spec = config.speculative_config
+    target = config.model_config
+    compilation = config.compilation_config
+    if (
+        spec is None
+        or spec.method != "leagle"
+        or getattr(target, "architecture", None) != "Qwen3ForCausalLM"
+        or getattr(spec.target_model_config, "architecture", None) != "Qwen3ForCausalLM"
+    ):
+        return "requires a Qwen3ForCausalLM target with LEAGLE speculation"
+    if not config.use_v2_model_runner or target.enforce_eager or compilation.cudagraph_mode != CUDAGraphMode.FULL:
+        return "requires Model Runner V2 with cudagraph_mode=FULL"
+    if not get_current_hardware_profile().supports(HardwareCapability.FLASH_ATTN_NPU_3):
+        return "the device does not support the flash_attn_npu_3 backend"
+
+    ascend = get_ascend_config()
+    if selected_backend is not None or (ascend.rl_config.enabled and ascend.rl_config.enable_training_consistency):
+        return "conflicts with an explicit attention backend or RL training-consistency backend"
+    parallel = config.parallel_config
+    if (
+        parallel.pipeline_parallel_size != 1
+        or parallel.prefill_context_parallel_size != 1
+        or parallel.decode_context_parallel_size != 1
+        or parallel.use_ubatching
+        or parallel.use_sequence_parallel_moe
+        or compilation.pass_config.enable_sp
+        or ascend.kvpp_config.size != 1
+    ):
+        return "requires PP/PCP/DCP/KVPP sizes of 1 without sequence parallelism or microbatching"
+    if (
+        config.kv_transfer_config is not None
+        or config.lora_config is not None
+        or ascend.sparse_kv_offload_config.enabled
+        or spec.enable_adaptive_verification
+        or spec.parallel_drafting
+    ):
+        return "does not support KV transfer/offload, LoRA, adaptive verification or parallel drafting"
+
+    if (
+        backend_key != (False, False, False)
+        or selector.attn_type != AttentionType.DECODER
+        or any(
+            getattr(selector, flag, False)
+            for flag in (
+                "has_sink",
+                "has_sliding_window",
+                "use_mm_prefix",
+                "use_non_causal",
+                "use_per_head_quant_scales",
+                "use_batch_invariant",
+                "use_kv_connector",
+                "use_pcp",
+                "use_dcp",
+                "use_rswa",
+                "use_adaptive_verification",
+            )
+        )
+    ):
+        return "requires ordinary dense causal attention without attention sinks, sliding windows or special layouts"
+
+    kv_dtypes = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
+    if (
+        not 0 < selector.head_size <= 256
+        or selector.dtype not in kv_dtypes
+        or selector.kv_cache_dtype not in (None, "auto", kv_dtypes[selector.dtype])
+        or config.cache_config.cache_dtype not in ("auto", kv_dtypes[selector.dtype])
+        or selector.block_size not in (None, _LEAGLE_FA3_BLOCK_SIZE)
+        or config.cache_config.block_size not in (None, _LEAGLE_FA3_BLOCK_SIZE)
+        or envs_vllm.VLLM_KV_CACHE_LAYOUT not in _LEAGLE_FA3_CACHE_LAYOUTS
+        or getattr(config.cache_config, "kv_cache_layout", None) not in _LEAGLE_FA3_CACHE_LAYOUTS
+    ):
+        return "requires matching FP16/BF16 query and NHD KV cache, block size 128 and head size at most 256"
+
+    try:
+        module = import_module("flash_attn_npu_3")
+    except (ImportError, OSError, RuntimeError) as exc:
+        return f"flash_attn_npu_3 is unavailable ({exc})"
+    if not all(callable(getattr(module, name, None)) for name in ("get_scheduler_metadata", "flash_attn_with_kvcache")):
+        return "flash_attn_npu_3 does not provide the required tiling and attention APIs"
+    return None
 
 
 def _validate_fa3_backend(key, _attn_selector_config):

@@ -1614,13 +1614,15 @@ def test_copy_num_computed_tokens_to_cpu_records_event():
 @pytest.mark.parametrize("model_type", ["deepseek_v41", "other_model"])
 @pytest.mark.parametrize("speculative", [False, True])
 @pytest.mark.parametrize("pp_sync", [False, True])
-def test_cpu_length_sync_preserves_original_condition_except_v41(model_type, speculative, pp_sync):
+@pytest.mark.parametrize("device_fa3", [False, True])
+def test_cpu_length_snapshot_and_wait_share_the_same_condition(model_type, speculative, pp_sync, device_fa3):
     runner, output, batch, _ = _prepare_inputs_runner(speculator=speculative)
     output.scheduled_cached_reqs.req_ids = batch.req_ids
     runner.model_config.hf_config.model_type = model_type
     runner.sync_spec_pp_cpu_counts = pp_sync
+    runner._leagle_target_device_lengths = device_fa3
     runner._copy_num_computed_tokens_to_cpu = MagicMock()
-    expected = pp_sync or (speculative and model_type != "deepseek_v41")
+    expected = pp_sync or (speculative and not device_fa3 and model_type != "deepseek_v41")
     with patch.object(GPUModelRunner, "postprocess_sampled"):
         runner.postprocess_sampled("idx", "tok", 3, 2)
     assert runner._copy_num_computed_tokens_to_cpu.call_count == int(expected)
@@ -1628,6 +1630,13 @@ def test_cpu_length_sync_preserves_original_condition_except_v41(model_type, spe
     assert runner.num_computed_tokens_event.synchronize.call_count == int(expected)
     if expected:
         torch.testing.assert_close(runner.req_states.num_computed_tokens_cpu[:2], runner.num_computed_tokens_cpu[:2])
+    else:
+        for row, req_id in enumerate(batch.req_ids):
+            index = runner.req_states.req_id_to_index[req_id]
+            assert (
+                runner.input_buffers.seq_lens_cpu[row]
+                == runner.req_states.num_computed_tokens_cpu[index] + output.num_scheduled_tokens[req_id]
+            )
 
 
 def test_device_only_postprocess_keeps_device_update_without_d2h():

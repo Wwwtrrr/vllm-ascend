@@ -61,6 +61,7 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+from vllm_ascend.attention.leagle_fa3 import AscendLEagleFA3Backend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.profiling_chunk_predictor import (
@@ -504,6 +505,33 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.model_state.kvpp_runtime = self.kvpp
 
+        # In this configuration LEAGLE creates no framework attention groups
+        # of its own. Check the bound target layers before dropping the CPU
+        # snapshot; a mixture could leave a FIA consumer on the old path.
+        backends = {group.backend for groups in self.attn_groups for group in groups}
+        self._leagle_target_device_lengths = AscendLEagleFA3Backend in backends
+        if self._leagle_target_device_lengths:
+            from vllm_ascend.worker.v2.model_states.default import AscendModelState
+
+            if (
+                backends != {AscendLEagleFA3Backend}
+                or type(self.model_state) is not AscendModelState
+                or self.speculative_config is None
+                or self.speculative_config.method != "leagle"
+                or self.speculator is None
+                or self.sync_spec_pp_cpu_counts
+                or self.pcp_manager is not None
+                or self.dcp_size != 1
+                or self.kvpp.scheduler is not None
+                or self.vllm_config.kv_transfer_config is not None
+                or sparse_cfg.enabled
+                or self.adaptive_verification is not None
+            ):
+                raise RuntimeError(
+                    "LEAGLE device-length FA3 requires a supported target configuration and all FA3 layers"
+                )
+            logger.info("LEAGLE target FA3 uses device sequence lengths; runner length D2H and wait are disabled.")
+
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""
         manager = self.sparse_kv_offload_manager
@@ -871,8 +899,12 @@ class NPUModelRunner(GPUModelRunner):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager:
-            # This is only required for vllm-ascend.
+        if (
+            batch_desc.cg_mode == CUDAGraphMode.FULL
+            and not adaptive_verification_manager
+            and not getattr(self, "_leagle_target_device_lengths", False)
+        ):
+            # Host-list FIA needs synthetic query spans for graph padding.
             query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
                 num_tokens_after_padding,
                 num_reqs_padded,
@@ -1257,13 +1289,7 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # TODO: Gate CPU length synchronization by backend requirements, not
-        # speculative decoding alone. V4.1 uses device lengths; extend this
-        # exemption to other backends that do not need exact CPU seq_lens.
-        # Non-last PP stages receive rejections without owning a speculator.
-        if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
-        ) or self.sync_spec_pp_cpu_counts:
+        if self._needs_spec_length_snapshot():
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
@@ -1287,6 +1313,15 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.num_computed_tokens_event.record()
 
+    def _needs_spec_length_snapshot(self) -> bool:
+        # Use the same decision at the D2H producer and the next-step wait.
+        # Non-last PP stages can receive rejections without a speculator.
+        return self.sync_spec_pp_cpu_counts or (
+            self.speculator is not None
+            and not getattr(self, "_leagle_target_device_lengths", False)
+            and not is_deepseek_v41(self.model_config.hf_config)
+        )
+
     def _update_seq_lens_cpu(
         self,
         scheduler_output: SchedulerOutput,
@@ -1297,9 +1332,7 @@ class NPUModelRunner(GPUModelRunner):
         # Speculative decoding needs corrected num_computed_tokens after rejection.
         # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
         # so this update also corrects the num_computed_tokens_np used by PCP.
-        if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
-        ) or self.sync_spec_pp_cpu_counts:
+        if self._needs_spec_length_snapshot():
             # Blocks CPU submission until D2H completes; may stall the async pipeline.
             self.num_computed_tokens_event.synchronize()
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
