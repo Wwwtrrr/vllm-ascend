@@ -664,6 +664,7 @@ class AscendConfig:
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     leagle_target_device_fa3: StrictBool = False
+    leagle_target_input_full_graph: StrictBool = False
     kv_trace: KVTraceConfig = dataclasses.field(default_factory=KVTraceConfig)
     kv_pool_range_debug: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"

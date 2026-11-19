@@ -304,3 +304,29 @@ checkpoint and backend. To capture matching traces with an existing
 and once with it set to `True`. In the Host trace, compare the synchronize
 associated with the speculative sequence-length copy. In the device trace,
 compare the tiling and target graph replay on the same decode rounds.
+
+### Target input kernels in the FULL graph
+
+Keep FA3 enabled and set `leagle_target_input_full_graph` to capture the KV
+block-table gather, slot mapping, and RoPE cosine/sine preparation before the
+target forward in the same FULL graph.
+
+```python
+additional_config = {
+    "leagle_target_device_fa3": True,
+    "leagle_target_input_full_graph": True,
+}
+# Pass async_scheduling=False to LLM along with this additional_config.
+```
+
+The runner stages the scheduled request indices into a persistent buffer for
+the selected graph. Padded requests write no KV slots. The host scheduler,
+position/sequence length calculation, and FA3 tiling run before replay.
+Batches dispatched to eager use the ordinary preparation path.
+
+Set only `leagle_target_input_full_graph` to `False` for an FA3 baseline on
+the same branches. Compare the interval between target replays and
+`Acceptance length` as well as TPOT and ITL.
+
+Use the same checkpoint environment variables as above, with
+`-k real_qwen3_leagle_fa3_target_input_prefix`, to compare the two FA3 runs.

@@ -697,6 +697,15 @@ class NPUPlatform(Platform):
         _validate_sfa_dcp_kv_sp(vllm_config)
         if getattr(ascend_config, _LEAGLE_FA3_OPTION, False):
             _validate_leagle_target_device_fa3_config(vllm_config, ascend_config)
+        if getattr(ascend_config, "leagle_target_input_full_graph", False):
+            if not ascend_config.leagle_target_device_fa3:
+                raise ValueError("leagle_target_input_full_graph requires leagle_target_device_fa3=True.")
+            if vllm_config.scheduler_config.async_scheduling is not False:
+                raise ValueError("leagle_target_input_full_graph requires async_scheduling=False.")
+            from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+
+            if not hasattr(ModelCudaGraphManager, "_prepare_fullgraph_inputs"):
+                raise ValueError("leagle_target_input_full_graph requires the matching vLLM experiment branch.")
 
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)

@@ -196,6 +196,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         graph.update(self.update_stream, resolved_tasks)
         return ret
 
+    def _prepare_fullgraph_inputs(self, desc: BatchExecutionDescriptor) -> None:
+        if (input_graph := getattr(self.model_runner, "_leagle_target_input_graph", None)) is not None:
+            input_graph.capture(desc)
+
     def capture(
         self,
         model: nn.Module,
@@ -213,6 +217,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
+        if (input_graph := getattr(self.model_runner, "_leagle_target_input_graph", None)) is not None:
+            input_graph.clear_dummy()
         metadata = getattr(model_state, "device_metadata", None)
         model = ModelWithContext(model, device_metadata=metadata)
         try:

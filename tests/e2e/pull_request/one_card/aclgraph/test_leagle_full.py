@@ -385,7 +385,33 @@ def _target_attention_state(worker):
     )
 
 
-def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
+def _count_target_input_prefix_replays(worker):
+    runner = worker.model_runner
+    original = runner.prepare_attn
+    counts = dict(replays=0, prefill_replays=0, outside_graph_prefills=0)
+    runner.leagle_test_input_prefix_counts = counts
+
+    def prepare_attn(input_batch):
+        result = original(input_batch)
+        if getattr(input_batch, "leagle_target_inputs_in_graph", False):
+            counts["replays"] += 1
+            counts["prefill_replays"] += int(input_batch.has_prefill)
+        elif input_batch.has_prefill:
+            counts["outside_graph_prefills"] += 1
+        return result
+
+    runner.prepare_attn = prepare_attn
+
+
+def _target_input_prefix_stats(worker):
+    runner = worker.model_runner
+    return dict(
+        enabled=getattr(runner, "_leagle_target_input_graph", None) is not None,
+        **runner.leagle_test_input_prefix_counts,
+    )
+
+
+def _serve_real_fa3(target, draft, draft_variant, backend, output_path, target_input_graph=None):
     os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     from vllm import LLM, SamplingParams
     from vllm.v1.metrics.reader import Counter, Histogram
@@ -393,6 +419,9 @@ def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
     spec = dict(method="leagle", model=draft, num_speculative_tokens=7)
     if draft_variant == "r640":
         spec["leagle_use_candidate_head"] = True
+    additional_config = dict(leagle_target_device_fa3=backend == "fa3")
+    if target_input_graph is not None:
+        additional_config["leagle_target_input_full_graph"] = target_input_graph == "on"
     max_model_len = 2048
     llm = LLM(
         model=target,
@@ -407,7 +436,7 @@ def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
         block_size=128,
         seed=42,
         speculative_config=spec,
-        additional_config=dict(leagle_target_device_fa3=backend == "fa3"),
+        additional_config=additional_config,
         compilation_config=dict(cudagraph_mode="FULL", cudagraph_capture_sizes=[8]),
     )
     state = llm.collective_rpc(_target_attention_state)
@@ -428,12 +457,17 @@ def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
     params = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True, detokenize=False)
     assert 1024 < len(tokenizer.encode(prompts[-1])) <= max_model_len - params.max_tokens
     llm.generate(prompts[:1], params, use_tqdm=False)
+    if target_input_graph is not None:
+        tokens = tokenizer.encode(prompts[0], add_special_tokens=False)[:8]
+        assert len(tokens) == 8
+        prompts.insert(1, {"prompt_token_ids": tokens})
+        llm.collective_rpc(_count_target_input_prefix_replays)
     llm.collective_rpc(_count_target_replays)
-    graph_before, = llm.collective_rpc(_graph_stats)
+    (graph_before,) = llm.collective_rpc(_graph_stats)
     before = {metric.name: metric for metric in llm.get_metrics()}
     responses = llm.generate(prompts, params, use_tqdm=False)
     after = {metric.name: metric for metric in llm.get_metrics()}
-    graph_after, = llm.collective_rpc(_graph_stats)
+    (graph_after,) = llm.collective_rpc(_graph_stats)
     timings = {}
     for name, key in (
         ("request_time_per_output_token_seconds", "tpot_mean_ms"),
@@ -457,39 +491,52 @@ def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
         acceptance_length=1 + counts["num_accepted_tokens"] / counts["num_drafts"],
         counts=counts,
     )
+    if target_input_graph is not None:
+        (result["target_input_prefix"],) = llm.collective_rpc(_target_input_prefix_stats)
     Path(output_path).write_text(json.dumps(result), encoding="utf-8")
 
 
-@pytest.mark.parametrize("draft_variant", ["r640", "5hs"])
-def test_real_qwen3_leagle_fa3_matches_fia(tmp_path, draft_variant):
+def _real_leagle_checkpoint_paths(draft_variant):
     draft_env = f"LEAGLE_E2E_{draft_variant.upper()}_MODEL"
     target, draft = os.getenv("LEAGLE_E2E_TARGET_MODEL"), os.getenv(draft_env)
     if not target or not draft:
         pytest.skip(f"Set LEAGLE_E2E_TARGET_MODEL and {draft_env} to local checkpoint directories")
     assert Path(target).is_dir() and Path(draft).is_dir(), "Expected local checkpoint directories"
+    return target, draft
 
-    results = {}
-    for backend in ("fia", "fa3"):
-        output = tmp_path / f"{backend}.json"
-        subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "real-fa3",
-                target,
-                draft,
-                draft_variant,
-                backend,
-                str(output),
-            ],
-            check=True,
-            env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
-            timeout=600,
-        )
-        result = json.loads(output.read_text(encoding="utf-8"))
-        results[backend] = result
-        print(draft_variant, backend, result["timings"], "acceptance_length", result["acceptance_length"])
-        assert result["graph"]["target"] > 0 and result["graph"]["draft"] > 0
+
+def _run_real_leagle_trial(output, target, draft, draft_variant, backend, target_input_graph=None):
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "real-fa3",
+        target,
+        draft,
+        draft_variant,
+        backend,
+        str(output),
+    ]
+    if target_input_graph is not None:
+        command.append(target_input_graph)
+    subprocess.run(
+        command,
+        check=True,
+        env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
+        timeout=600,
+    )
+    result = json.loads(output.read_text(encoding="utf-8"))
+    print(draft_variant, output.stem, result["timings"], "acceptance_length", result["acceptance_length"])
+    assert result["graph"]["target"] > 0 and result["graph"]["draft"] > 0
+    return result
+
+
+@pytest.mark.parametrize("draft_variant", ["r640", "5hs"])
+def test_real_qwen3_leagle_fa3_matches_fia(tmp_path, draft_variant):
+    target, draft = _real_leagle_checkpoint_paths(draft_variant)
+    results = {
+        backend: _run_real_leagle_trial(tmp_path / f"{backend}.json", target, draft, draft_variant, backend)
+        for backend in ("fia", "fa3")
+    }
 
     assert results["fia"]["state"] == [
         dict(device_lengths=False, backends=["vllm_ascend.attention.attention_v1.AscendAttentionBackend"])
@@ -498,6 +545,25 @@ def test_real_qwen3_leagle_fa3_matches_fia(tmp_path, draft_variant):
         dict(device_lengths=True, backends=["vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"])
     ]
     assert results["fa3"]["outputs"] == results["fia"]["outputs"]
+
+
+@pytest.mark.parametrize("draft_variant", ["r640", "5hs"])
+def test_real_qwen3_leagle_fa3_target_input_prefix(tmp_path, draft_variant):
+    target, draft = _real_leagle_checkpoint_paths(draft_variant)
+    baseline = _run_real_leagle_trial(tmp_path / "fa3_input_off.json", target, draft, draft_variant, "fa3", "off")
+    optimized = _run_real_leagle_trial(tmp_path / "fa3_input_on.json", target, draft, draft_variant, "fa3", "on")
+
+    expected_state = [
+        dict(device_lengths=True, backends=["vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"])
+    ]
+    assert baseline["state"] == optimized["state"] == expected_state
+    assert baseline["target_input_prefix"]["enabled"] is False
+    assert baseline["target_input_prefix"]["replays"] == 0
+    stats = optimized["target_input_prefix"]
+    assert stats["enabled"] is True
+    assert 0 < stats["prefill_replays"] < stats["replays"] <= optimized["graph"]["target"]
+    assert stats["outside_graph_prefills"] > 0
+    assert optimized["outputs"] == baseline["outputs"]
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ class AscendInputBatch(InputBatch):
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
+    leagle_target_inputs_in_graph: bool = False
 
     @classmethod
     def make_dummy(

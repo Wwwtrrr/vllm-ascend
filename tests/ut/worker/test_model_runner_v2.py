@@ -1678,6 +1678,8 @@ def _run_prepare_inputs(
     ):
         prepared = runner.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0)
         batch.is_padding = make_batch.call_args.kwargs["is_padding"]
+        batch.leagle_target_inputs_in_graph = make_batch.call_args.kwargs["leagle_target_inputs_in_graph"]
+        batch.query_start_loc_np = make_batch.call_args.kwargs["query_start_loc_np"]
         assert make_batch.call_args.kwargs["decode_graph_eligible"] == batch_req_state.decode_graph_eligible
         assert make_batch.call_args.kwargs["prefill_runs_as_decode_np"] is batch_req_state.prefill_runs_as_decode_np
         assert make_batch.call_args.kwargs["max_seq_len_np"] is batch_req_state.max_seq_len_np
@@ -1692,6 +1694,46 @@ def test_prepare_inputs_common_path():
     assert out is partitioned
     runner.eplb.set_batch_phase.assert_called_once_with(True)
     np.testing.assert_array_equal(runner.input_buffers.seq_lens_cpu[:2], np.array([3, 4], dtype=np.int32))
+
+
+@pytest.mark.parametrize("captured", [True, False])
+def test_leagle_target_inputs_defer_only_on_a_captured_full_graph(captured):
+    runner, scheduler_output, state, desc = _prepare_inputs_runner(full_cg=True)
+    desc.num_reqs = 3
+    runner.cudagraph_manager = SimpleNamespace(graphs=(desc,) if captured else ())
+    staged = Mock(return_value=torch.tensor([0, 1], dtype=torch.int32))
+    runner._leagle_target_input_graph = SimpleNamespace(stage=staged)
+
+    out, _ = _run_prepare_inputs(runner, scheduler_output, state, desc)
+
+    assert out.leagle_target_inputs_in_graph is captured
+    if captured:
+        staged.assert_called_once_with(state.idx_mapping_np, 3)
+        np.testing.assert_array_equal(out.query_start_loc_np, [0, 2, 4, 4])
+    else:
+        staged.assert_not_called()
+        np.testing.assert_array_equal(out.query_start_loc_np, [0, 2, 4, 8])
+
+
+def test_leagle_target_attn_returns_capture_buffers_without_preparing_them():
+    runner = _make_runner()
+    table = torch.arange(12, dtype=torch.int32).view(4, 3)
+    slots = torch.arange(16, dtype=torch.int32).view(1, 16)
+    runner.block_tables = SimpleNamespace(input_block_tables=[table], slot_mappings=slots, _num_dirty_rows=1)
+    input_batch = SimpleNamespace(
+        leagle_target_inputs_in_graph=True, num_reqs_after_padding=3, num_tokens_after_padding=8
+    )
+
+    with patch.object(GPUModelRunner, "prepare_attn") as prepare_eager:
+        tables, mappings = runner.prepare_attn(input_batch)
+        prepare_eager.assert_not_called()
+        assert tables[0].shape == (3, 3) and tables[0].data_ptr() == table.data_ptr()
+        assert mappings.shape == (1, 8) and mappings.data_ptr() == slots.data_ptr()
+        assert runner.block_tables._num_dirty_rows == 3
+
+        input_batch.leagle_target_inputs_in_graph = False
+        runner.prepare_attn(input_batch)
+        prepare_eager.assert_called_once_with(input_batch)
 
 
 @pytest.mark.parametrize("enabled", [True, False])

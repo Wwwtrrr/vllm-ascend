@@ -576,6 +576,13 @@ class NPUModelRunner(GPUModelRunner):
         )
         if getattr(self.ascend_config, "leagle_target_device_fa3", False):
             self._enable_leagle_target_device_lengths()
+        if getattr(self.ascend_config, "leagle_target_input_full_graph", False):
+            from vllm_ascend.worker.v2.spec_decode.leagle_target_inputs import LEagleTargetInputGraph
+
+            if self.extensible_kv_cache is not None:
+                raise ValueError("leagle_target_input_full_graph requires a fixed KV cache allocation.")
+            self._leagle_target_input_graph = LEagleTargetInputGraph(self.block_tables, self.input_buffers)
+            logger.info_once("LEAGLE target KV inputs will be captured in the target FULL graph.", scope="process")
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
@@ -894,8 +901,18 @@ class NPUModelRunner(GPUModelRunner):
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
         num_reqs = len(req_ids)
+        input_graph = getattr(self, "_leagle_target_input_graph", None)
+        inputs_in_graph = (
+            input_graph is not None
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc in self.cudagraph_manager.graphs
+        )
+        if inputs_in_graph:
+            assert graph_num_reqs is not None and graph_num_reqs >= num_reqs
+            idx_mapping = input_graph.stage(idx_mapping_np, graph_num_reqs)
+        else:
+            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         num_valid_tokens = num_scheduled_tokens_np
         if scheduler_output.scheduled_spec_decode_tokens:
@@ -963,8 +980,9 @@ class NPUModelRunner(GPUModelRunner):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
 
-        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager:
-            # This is only required for vllm-ascend.
+        if batch_desc.cg_mode == CUDAGraphMode.FULL and not adaptive_verification_manager and not inputs_in_graph:
+            # FIA requires the last offset to include graph padding. FA3 can
+            # leave the trailing offsets at the actual token count.
             query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
                 num_tokens_after_padding,
                 num_reqs_padded,
@@ -1132,6 +1150,7 @@ class NPUModelRunner(GPUModelRunner):
             # extra attributes for ascend npus.
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
+            leagle_target_inputs_in_graph=inputs_in_graph,
         )
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.
@@ -1139,7 +1158,8 @@ class NPUModelRunner(GPUModelRunner):
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
-        update_cos_sin(input_batch.positions)
+        if not inputs_in_graph:
+            update_cos_sin(input_batch.positions)
 
         return input_batch
 
@@ -1154,9 +1174,25 @@ class NPUModelRunner(GPUModelRunner):
         # only feeds FastPrefillHelper, which this Ascend path does not use.
         return self._prepare_inputs_impl(scheduler_output, batch_req_state, batch_desc)
 
+    def prepare_attn(self, input_batch: AscendInputBatch) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if not getattr(input_batch, "leagle_target_inputs_in_graph", False):
+            return super().prepare_attn(input_batch)
+
+        # FA3 tiling uses the page table's width and address, not the entries.
+        # The captured input kernels fill these persistent views before attention.
+        num_reqs = input_batch.num_reqs_after_padding
+        block_tables = self.block_tables
+        block_tables._num_dirty_rows = max(block_tables._num_dirty_rows, num_reqs)
+        return (
+            tuple(table[:num_reqs] for table in block_tables.input_block_tables),
+            block_tables.slot_mappings[:, : input_batch.num_tokens_after_padding],
+        )
+
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if (input_graph := getattr(self, "_leagle_target_input_graph", None)) is not None:
+            input_graph.clear_dummy()
         block_tables, slot_mappings = super().prepare_dummy_attn(
             input_batch,
             valid_state_slots=valid_state_slots,
