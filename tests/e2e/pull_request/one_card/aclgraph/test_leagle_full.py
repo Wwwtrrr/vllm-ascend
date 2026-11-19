@@ -1,0 +1,512 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Real NPU capture/replay and target-only/eager/FULL serving equivalence."""
+
+import copy
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from safetensors.torch import save_file
+from transformers import Qwen3Config, Qwen3ForCausalLM
+
+pytest.importorskip("torch_npu")
+if not torch.npu.is_available():
+    pytest.skip("LEAGLE FULL requires an NPU", allow_module_level=True)
+
+from vllm.model_executor.models.qwen3_leagle import LEagleDraftModel
+from vllm.v1.worker.gpu.spec_decode.leagle.context import LEagleContext
+from vllm.v1.worker.gpu.spec_decode.leagle.execution import (
+    LEagleExecution,
+    LEagleExecutionOptions,
+    LEagleOptimizedGraphRunner,
+)
+from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
+    LEagleGraphInputs,
+    LEagleGraphRunner,
+    NativeLEagleGraphBackend,
+)
+
+from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.leagle_quant import AscendLEagleInt8Head
+
+
+def _draft(config):
+    hf = SimpleNamespace(leagle_config=config)
+    return LEagleDraftModel(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(draft_model_config=SimpleNamespace(hf_config=hf))
+        )
+    ).eval()
+
+
+def _architecture():
+    decoder = Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=512,
+        eos_token_id=None,
+        bos_token_id=1,
+        pad_token_id=0,
+        layer_types=["full_attention", "sliding_attention"],
+        sliding_window=16,
+    )
+    return dict(
+        transformer_layer_config=decoder.to_dict(),
+        aux_hidden_state_layer_ids=[0, 2, 3],
+        num_loops=2,
+        norm_output=True,
+        draft_vocab_size=64,
+    )
+
+
+@torch.inference_mode()
+def test_native_acl_graph_matches_eager_after_context_shrink():
+    torch.manual_seed(42)
+    model = _draft(_architecture()).to(device="npu", dtype=torch.bfloat16)
+    inputs = LEagleGraphInputs.allocate(model, 257, 17, dtype=torch.bfloat16, device="npu")
+    manager = LEagleGraphRunner(
+        model,
+        inputs,
+        3,
+        NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph),
+    )
+    manager.capture()
+    for length in (129, 1, 257, 7):
+        features = torch.randn(length, 96, device="npu", dtype=torch.bfloat16)
+        expected_context = model.project_context(features)
+        context = manager.project_context(features)
+        torch.testing.assert_close(context, expected_context)
+        anchor = torch.tensor([[5]], device="npu")
+        expected = model.propose_context(context[None], anchor, 3)
+        actual = manager.propose(context[None], anchor, 3)
+        torch.testing.assert_close(actual, expected)
+    assert manager.proposal_replays == manager.projection_replays == 4
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("candidate", [
+    False, True, "quant",
+    "candidate_quant", "candidate_quant_direct",
+])
+def test_native_optimized_batch_cache_and_fused_norm_match_reference(candidate):
+    torch.manual_seed(42)
+    config = _architecture()
+    if candidate is True:
+        config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        config.update(candidate_head=True, candidate_head_rank=32, candidate_head_top_k=7,
+                      candidate_rerank=candidate != "candidate_quant_direct")
+    model = _draft(config).to(device="npu", dtype=torch.bfloat16)
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
+        adapter.model = model
+        adapter.speculative_config = SimpleNamespace(
+            leagle_lm_head_quantization="w8a8", leagle_release_quantized_source=True
+        )
+        adapter.configure_lm_head_quantization()
+        assert model.has_quantized_candidate_head
+        assert model.candidate_head.up_proj is None
+        assert (model.lm_head is None) == (candidate == "candidate_quant_direct")
+    if candidate == "quant":
+        import torch_npu
+
+        model.set_quantized_lm_head(
+            AscendLEagleInt8Head(
+                model.lm_head.weight, ops=torch_npu, weight_format=lambda w: torch_npu.npu_format_cast(w, 29)
+            ),
+            release_source=True,
+        )
+        assert model.lm_head is None
+    reference = copy.deepcopy(model)
+    adapter = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
+    model.configure_inference(fused_projections=True, rms_norm=adapter.create_rmsnorm_impl())
+    context = LEagleContext(3, 16, 32, dtype=torch.bfloat16, device="npu")
+    execution = LEagleExecution(model, context, 16, 3, LEagleExecutionOptions(), dtype=torch.bfloat16, device="npu")
+    manager = LEagleOptimizedGraphRunner(
+        execution, NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    )
+    manager.capture()
+    anchors = torch.tensor([[3], [5], [7]], device="npu")
+    history = {}
+    for rows in ([(2, 0, 4), (0, 0, 2)], [(0, 2, 3), (2, 4, 2)]):
+        inputs = [torch.randn(count, 96, device="npu", dtype=torch.bfloat16) for _, _, count in rows]
+        positions = torch.cat([torch.arange(start, start + count, device="npu") for _, start, count in rows])
+        execution.project(torch.cat(inputs), positions, manager)
+        begin = 0
+        updates = []
+        for (slot, start, count), features in zip(rows, inputs):
+            updates.append((slot, str(slot), start, begin, begin + count))
+            history[slot] = features if start == 0 else torch.cat((history[slot][:start], features))
+            begin += count
+        execution.update_batch(updates, manager)
+        result = torch.full((2, 3), -1, dtype=torch.long, device="npu")
+        execution.propose([(row, slot) for row, (slot, _, _) in enumerate(rows)], anchors, result, 3, manager)
+        for row, (slot, _, _) in enumerate(rows):
+            prefix = reference.project_context(history[slot][None])
+            expected = reference.propose_context(prefix, anchors[slot : slot + 1], 3)
+            torch.testing.assert_close(result[row : row + 1], expected)
+    assert manager.proposal_replays == manager.projection_replays == 2
+    assert manager.update_replays == 2
+
+
+@torch.inference_mode()
+def test_native_cache_update_batches_sixteen_requests_in_one_replay():
+    torch.manual_seed(42)
+    model = _draft(_architecture()).to(device="npu", dtype=torch.bfloat16)
+    context = LEagleContext(16, 8, 32, dtype=torch.bfloat16, device="npu")
+    execution = LEagleExecution(model, context, 64, 3, LEagleExecutionOptions(), dtype=torch.bfloat16, device="npu")
+    manager = LEagleOptimizedGraphRunner(
+        execution, NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    )
+    manager.capture()
+    features = torch.randn(64, 96, device="npu", dtype=torch.bfloat16)
+    execution.project(features, torch.arange(64, device="npu") % 3, manager)
+    expected_features = execution.projected.clone()
+    expected_kv = tuple(tuple(t.clone() for t in pair) for pair in execution.new_kv)
+    updates = [(slot, str(slot), 0, slot * 3, slot * 3 + 3) for slot in range(16)]
+    execution.update_batch(updates, manager)
+    assert manager.update_replays == 1
+    execution.update_batch([], manager)
+    assert manager.update_replays == 1
+    for slot, _, _, begin, end in updates:
+        torch.testing.assert_close(context.values[slot, :3], expected_features[begin:end])
+        for cached, expected in zip(execution.prefix_kv, expected_kv):
+            for storage, value in zip(cached, expected):
+                torch.testing.assert_close(storage[slot : slot + 1, :, :3], value[:, :, begin:end])
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("width", [32, 640])
+def test_native_int8_full_head_matches_integer_reference_and_changed_input_replay(width):
+    import torch_npu
+
+    torch.manual_seed(42)
+    weight = torch.randn(64, width, dtype=torch.bfloat16, device="npu")
+    before = weight.clone()
+    head = AscendLEagleInt8Head(weight, ops=torch_npu, weight_format=lambda w: w)
+    hidden = torch.randn(2, 1, width, dtype=torch.bfloat16, device="npu")
+    backend = NativeLEagleGraphBackend(torch.npu, torch.device("npu:0"), torch.npu.NPUGraph)
+    graph, output = backend.capture(lambda: head(hidden))
+    for _ in range(3):
+        hidden.normal_()
+        q, scale = torch_npu.npu_dynamic_quant(hidden.view(2, width), dst_type=torch.int8)
+        expected = (
+            (q.cpu().int() @ head.weight_int8.cpu().int()).float()
+            * scale.cpu().reshape(-1, 1)
+            * head.weight_scale.cpu()[None, :]
+        ).to(torch.bfloat16)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(output.view(2, 64).cpu(), expected)
+        torch.testing.assert_close(output, head(hidden))
+    torch.testing.assert_close(weight, before)
+    assert not head.state_dict()
+
+
+def _count_target_replays(worker):
+    manager = worker.model_runner.cudagraph_manager
+    assert manager.graphs, "Target FULL graph capture was skipped"
+    original = manager.run_fullgraph
+    manager.leagle_test_replays = 0
+
+    def run(*args, **kwargs):
+        manager.leagle_test_replays += 1
+        return original(*args, **kwargs)
+
+    manager.run_fullgraph = run
+
+
+def _graph_stats(worker):
+    runner = worker.model_runner
+    draft = runner.speculator.graph_runner
+    return dict(
+        target=runner.cudagraph_manager.leagle_test_replays,
+        draft=draft.proposal_replays,
+        projection=draft.projection_replays,
+        cache_update=draft.update_replays,
+    )
+
+
+def _tp_state(worker):
+    model = worker.model_runner.speculator.model
+    return dict(
+        size=model.tp.size,
+        local_head_rows=model.local_vocab_size,
+        local_q_heads=model.layers[0].self_attn.num_heads,
+        local_kv_heads=model.layers[0].self_attn.num_kv_heads,
+        local_mlp=model.layers[0].mlp.gate_proj.out_features,
+        proposals=worker.model_runner.speculator.draft_tokens[:2].cpu().tolist(),
+    )
+
+
+def _serve(mode, target, draft, output_path, head_mode="none", tp="1"):
+    # Worker subprocesses import the serving stack after selecting V2.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    from vllm import LLM, SamplingParams
+
+    kwargs = dict(
+        model=target,
+        tensor_parallel_size=int(tp),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        enforce_eager=mode == "eager",
+        enable_prefix_caching=False,
+        gpu_memory_utilization=0.4,
+    )
+    if draft != "none":
+        kwargs["speculative_config"] = dict(method="leagle", model=draft, num_speculative_tokens=3)
+        if head_mode == "quant":
+            kwargs["speculative_config"]["leagle_lm_head_quantization"] = "w8a8"
+        elif head_mode in ("candidate_quant", "candidate_quant_direct"):
+            kwargs["speculative_config"].update(
+                leagle_use_candidate_head=True,
+                leagle_candidate_rerank=head_mode != "candidate_quant_direct",
+                leagle_lm_head_quantization="w8a8",
+            )
+            if head_mode == "candidate_quant":
+                kwargs["speculative_config"]["leagle_candidate_top_k"] = 7
+        if head_mode in ("quant",  "candidate_quant", "candidate_quant_direct"):
+            kwargs["speculative_config"]["leagle_release_quantized_source"] = True
+    if mode != "eager":
+        kwargs["compilation_config"] = dict(
+            cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16],
+            pass_config=dict(enable_sp=False),
+        )
+    else:
+        kwargs["compilation_config"] = dict(pass_config=dict(enable_sp=False))
+    llm = LLM(**kwargs)
+    if mode != "eager":
+        llm.collective_rpc(_count_target_replays)
+    params = SamplingParams(temperature=0, max_tokens=12, ignore_eos=True, detokenize=False)
+    outputs = []
+    for prompts in (([2, 3, 4], [7] * 17), ([8] * 37, [9])):
+        responses = llm.generate([{"prompt_token_ids": p} for p in prompts], params)
+        outputs.extend([list(response.outputs[0].token_ids) for response in responses])
+    stats = llm.collective_rpc(_graph_stats) if mode != "eager" else []
+    shards = llm.collective_rpc(_tp_state) if draft != "none" else []
+    Path(output_path).write_text(json.dumps(dict(outputs=outputs, stats=stats, shards=shards)), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["FULL", "FULL_DECODE_ONLY"])
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("candidate", [
+    False, True, "quant",
+    "candidate_quant", "candidate_quant_direct",
+])
+def test_target_and_draft_full_match_target_only_and_eager(tmp_path, mode, candidate, tp):
+    if torch.npu.device_count() < tp:
+        pytest.skip(f"Requires {tp} visible NPUs")
+    torch.manual_seed(42)
+    config = _architecture()
+    if candidate is True:
+        config.update(candidate_head=True, candidate_head_rank=8, candidate_head_top_k=7)
+    if candidate in ("candidate_quant", "candidate_quant_direct"):
+        config.update(candidate_head=True, candidate_head_rank=32, candidate_head_top_k=7,
+                      candidate_rerank=candidate != "candidate_quant_direct")
+    target_config = Qwen3Config(**config["transformer_layer_config"])
+    target_config.num_hidden_layers = 4
+    target_config.layer_types = ["full_attention"] * 4
+    target = Qwen3ForCausalLM(target_config).eval()
+    target_path, draft_path = tmp_path / "target", tmp_path / "draft"
+    target.save_pretrained(target_path)
+    draft_path.mkdir()
+    draft = _draft(config)
+    with torch.no_grad():
+        draft.embed_tokens.weight.copy_(target.model.embed_tokens.weight)
+        draft.lm_head.weight.copy_(target.lm_head.weight)
+    save_file(draft.state_dict(), draft_path / "model.safetensors")
+    checkpoint = dict(
+        config,
+        speculators_model_type="leagle",
+        architectures=["LEagleDraftModel"],
+        speculators_config=dict(
+            algorithm="leagle",
+            default_proposal_method="greedy",
+            proposal_methods=[dict(speculative_tokens=3)],
+            verifier=dict(name_or_path=str(target_path)),
+        ),
+    )
+    (draft_path / "config.json").write_text(json.dumps(checkpoint), encoding="utf-8")
+    results = []
+    for index, (run_mode, run_draft) in enumerate(
+        (
+            ("eager", "none"),
+            ("eager", str(draft_path)),
+            (mode, str(draft_path)),
+        )
+    ):
+        output = tmp_path / f"result_{index}.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                run_mode,
+                str(target_path),
+                run_draft,
+                str(output),
+                candidate if isinstance(candidate, str) else "none",
+                str(tp),
+            ],
+            check=True,
+            env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1"},
+            timeout=300,
+        )
+        results.append(json.loads(output.read_text(encoding="utf-8")))
+    assert results[0]["outputs"] == results[1]["outputs"] == results[2]["outputs"]
+    assert results[2]["stats"]
+    assert all(all(value > 0 for value in stats.values()) for stats in results[2]["stats"])
+    assert len(results[2]["stats"]) == tp
+    for result in results[1:]:
+        shards = result["shards"]
+        assert len(shards) == tp
+        assert all(shard == shards[0] for shard in shards)
+        assert shards[0]["size"] == tp
+        assert shards[0]["local_head_rows"] == 64 // tp
+        assert shards[0]["local_q_heads"] == 4 // tp
+        assert shards[0]["local_kv_heads"] == 2 // tp
+        assert shards[0]["local_mlp"] == 64 // tp
+
+
+def _target_attention_state(worker):
+    runner = worker.model_runner
+    backends = {group.backend for cache_groups in runner.attn_groups for group in cache_groups}
+    return dict(
+        device_lengths=runner._leagle_target_device_lengths,
+        backends=sorted(f"{backend.__module__}.{backend.__name__}" for backend in backends),
+    )
+
+
+def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    from vllm import LLM, SamplingParams
+    from vllm.v1.metrics.reader import Counter, Histogram
+
+    spec = dict(method="leagle", model=draft, num_speculative_tokens=7)
+    if draft_variant == "r640":
+        spec["leagle_use_candidate_head"] = True
+    max_model_len = 2048
+    llm = LLM(
+        model=target,
+        tensor_parallel_size=1,
+        dtype="bfloat16",
+        max_model_len=max_model_len,
+        max_num_seqs=1,
+        max_num_batched_tokens=512,
+        async_scheduling=False,
+        enable_prefix_caching=False,
+        disable_log_stats=False,
+        block_size=128,
+        seed=42,
+        speculative_config=spec,
+        additional_config=dict(leagle_target_device_fa3=backend == "fa3"),
+        compilation_config=dict(cudagraph_mode="FULL", cudagraph_capture_sizes=[8], pass_config=dict(enable_sp=False)),
+    )
+    state = llm.collective_rpc(_target_attention_state)
+    tokenizer = llm.get_tokenizer()
+    texts = (
+        "Implement a Python function that returns the median of a list of integers.",
+        "Write a Python function that merges two sorted lists without using sort.",
+        "The code below is a repetitive example.\n"
+        + "total = total + value\n" * 220
+        + "Rewrite it as a single Python loop.",
+    )
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}], add_generation_prompt=True, tokenize=False, enable_thinking=False
+        )
+        for text in texts
+    ]
+    params = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True, detokenize=False)
+    assert 1024 < len(tokenizer.encode(prompts[-1])) <= max_model_len - params.max_tokens
+    llm.generate(prompts[:1], params, use_tqdm=False)
+    llm.collective_rpc(_count_target_replays)
+    graph_before, = llm.collective_rpc(_graph_stats)
+    before = {metric.name: metric for metric in llm.get_metrics()}
+    responses = llm.generate(prompts, params, use_tqdm=False)
+    after = {metric.name: metric for metric in llm.get_metrics()}
+    graph_after, = llm.collective_rpc(_graph_stats)
+    timings = {}
+    for name, key in (
+        ("request_time_per_output_token_seconds", "tpot_mean_ms"),
+        ("inter_token_latency_seconds", "itl_mean_ms"),
+    ):
+        start, end = before[f"vllm:{name}"], after[f"vllm:{name}"]
+        assert isinstance(start, Histogram) and isinstance(end, Histogram) and end.count > start.count
+        timings[key] = 1000 * (end.sum - start.sum) / (end.count - start.count)
+
+    counts = {}
+    for name in ("num_drafts", "num_draft_tokens", "num_accepted_tokens"):
+        start, end = before[f"vllm:spec_decode_{name}"], after[f"vllm:spec_decode_{name}"]
+        assert isinstance(start, Counter) and isinstance(end, Counter)
+        counts[name] = end.value - start.value
+    assert counts["num_drafts"] > 0
+    result = dict(
+        state=state,
+        graph={name: count - graph_before[name] for name, count in graph_after.items()},
+        outputs=[list(response.outputs[0].token_ids) for response in responses],
+        timings=timings,
+        acceptance_length=1 + counts["num_accepted_tokens"] / counts["num_drafts"],
+        counts=counts,
+    )
+    Path(output_path).write_text(json.dumps(result), encoding="utf-8")
+
+
+@pytest.mark.parametrize("draft_variant", ["r640", "5hs"])
+def test_real_qwen3_leagle_fa3_matches_fia(tmp_path, draft_variant):
+    draft_env = f"LEAGLE_E2E_{draft_variant.upper()}_MODEL"
+    target, draft = os.getenv("LEAGLE_E2E_TARGET_MODEL"), os.getenv(draft_env)
+    if not target or not draft:
+        pytest.skip(f"Set LEAGLE_E2E_TARGET_MODEL and {draft_env} to local checkpoint directories")
+    assert Path(target).is_dir() and Path(draft).is_dir(), "Expected local checkpoint directories"
+
+    results = {}
+    for backend in ("fia", "fa3"):
+        output = tmp_path / f"{backend}.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "real-fa3",
+                target,
+                draft,
+                draft_variant,
+                backend,
+                str(output),
+            ],
+            check=True,
+            env={**os.environ, "VLLM_ALLOW_INSECURE_SERIALIZATION": "1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
+            timeout=600,
+        )
+        result = json.loads(output.read_text(encoding="utf-8"))
+        results[backend] = result
+        print(draft_variant, backend, result["timings"], "acceptance_length", result["acceptance_length"])
+        assert result["graph"]["target"] > 0 and result["graph"]["draft"] > 0
+
+    assert results["fia"]["state"] == [
+        dict(device_lengths=False, backends=["vllm_ascend.attention.attention_v1.AscendAttentionBackend"])
+    ]
+    assert results["fa3"]["state"] == [
+        dict(device_lengths=True, backends=["vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"])
+    ]
+    assert results["fa3"]["outputs"] == results["fia"]["outputs"]
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "real-fa3":
+        _serve_real_fa3(*sys.argv[2:])
+    else:
+        _serve(*sys.argv[1:])

@@ -2120,6 +2120,31 @@ def test_cpu_length_sync_preserves_original_condition_except_v41(model_type, spe
         torch.testing.assert_close(runner.req_states.num_computed_tokens_cpu[:2], runner.num_computed_tokens_cpu[:2])
 
 
+@pytest.mark.parametrize("use_fa3", [False, True])
+def test_leagle_device_length_sync_requires_fa3_groups(use_fa3):
+    from vllm_ascend.worker.v2.model_states.default import AscendModelState
+    from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+
+    runner, output, batch, _ = _prepare_inputs_runner(speculator=True)
+    runner.model_state = AscendModelState.__new__(AscendModelState)
+    runner.speculator = AscendLEagleSpeculator.__new__(AscendLEagleSpeculator)
+    runner.speculator.attn_groups = []
+    backend = AscendFA3Backend if use_fa3 else AscendAttentionBackend
+    runner.attn_groups = [[SimpleNamespace(backend=AscendFA3Backend), SimpleNamespace(backend=backend)]]
+
+    if not use_fa3:
+        with pytest.raises(RuntimeError, match="every target KV group"):
+            runner._enable_leagle_target_device_lengths()
+        assert not runner._can_skip_spec_cpu_length_sync()
+        return
+
+    runner._enable_leagle_target_device_lengths()
+    runner._copy_num_computed_tokens_to_cpu()
+    runner._update_seq_lens_cpu(output, batch.req_ids)
+    runner.num_computed_tokens_event.record.assert_not_called()
+    runner.num_computed_tokens_event.synchronize.assert_not_called()
+
+
 def test_device_only_postprocess_keeps_device_update_without_d2h():
     runner = _make_runner()
     runner.speculator = object()

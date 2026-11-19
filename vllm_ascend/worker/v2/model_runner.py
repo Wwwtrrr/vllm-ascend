@@ -164,6 +164,7 @@ class NPUModelRunner(GPUModelRunner):
         # Adaptive verification uses this flag to apply FIA-specific query
         # boundary and sequence length padding during FULL graph execution.
         self.use_fia = False
+        self._leagle_target_device_lengths = False
         self._target_uses_flashmla = False
         # #56492: inherited dummy runs inspect this even on non-VMM platforms.
         self.extensible_kv_cache = None
@@ -573,6 +574,8 @@ class NPUModelRunner(GPUModelRunner):
             for groups in self.attn_groups
             for group in groups
         )
+        if getattr(self.ascend_config, "leagle_target_device_fa3", False):
+            self._enable_leagle_target_device_lengths()
 
         self.kvpp = KVPPRuntime.create_from_kv_cache(
             vllm_config=self.vllm_config,
@@ -1342,10 +1345,32 @@ class NPUModelRunner(GPUModelRunner):
         self._finalize_dump_data(dump=False)
         return output
 
+    def _enable_leagle_target_device_lengths(self) -> None:
+        from vllm_ascend.worker.v2.model_states.default import AscendModelState
+        from vllm_ascend.worker.v2.spec_decode.leagle import AscendLEagleSpeculator
+
+        backends = {group.backend for groups in self.attn_groups for group in groups}
+        if (
+            backends != {AscendFA3Backend}
+            or type(self.model_state) is not AscendModelState
+            or not isinstance(self.speculator, AscendLEagleSpeculator)
+            or self.speculator.attn_groups
+            or self.sync_spec_pp_cpu_counts
+        ):
+            raise RuntimeError(
+                "LEAGLE target device FA3 requires every target KV group to use FA3 "
+                "and the standard LEAGLE draft without attention metadata."
+            )
+        self._leagle_target_device_lengths = True
+        logger.info_once("LEAGLE target FA3 is active; skipping the speculative CPU length snapshot.", scope="process")
+
     def _can_skip_spec_cpu_length_sync(self) -> bool:
         """Allow device lengths for supported speculative-decoding paths."""
         if self.sync_spec_pp_cpu_counts:
             return False
+
+        if getattr(self, "_leagle_target_device_lengths", False):
+            return True
 
         if is_deepseek_v41(self.model_config.hf_config):
             return True

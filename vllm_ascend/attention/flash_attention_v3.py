@@ -5,8 +5,11 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cache
+from importlib.metadata import PackageNotFoundError, version
 
 import torch
+from packaging.version import InvalidVersion, Version
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import logger
 from vllm.v1.attention.backend import (
@@ -23,6 +26,17 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, notify_kv_cache_written
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
+
+
+@cache
+def has_fa3_device_length_dispatch() -> bool:
+    """Check for dense paged FA3 without a host length read during graph capture."""
+    try:
+        installed_version = Version(version("flash-attn-npu"))
+    except (InvalidVersion, PackageNotFoundError):
+        return False
+    # flash-attention-npu #417 moved long-KV FlashDecode dispatch to the device.
+    return installed_version >= Version("0.5.1.post1")
 
 
 def _get_window_size(sliding_window: int | None, causal: bool) -> tuple[int, int]:

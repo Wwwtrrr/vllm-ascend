@@ -374,6 +374,136 @@ def test_qwen_dflash2_unsupported_settings_keep_existing_backend(qwen_dflash2_fa
     assert r.select("backbone") == "AscendAttentionBackend"
 
 
+@pytest.fixture
+def leagle_fa3(monkeypatch):
+    from vllm.config import CUDAGraphMode
+
+    from vllm_ascend import platform
+    from vllm_ascend.attention import flash_attention_v3
+    from vllm_ascend.device.hardware import AscendDeviceType
+    from vllm_ascend.device.hardware_profile import get_hardware_profile
+
+    config = SimpleNamespace(
+        additional_config={},
+        model_config=SimpleNamespace(architecture="Qwen3ForCausalLM", enforce_eager=False, rswa_window=None),
+        speculative_config=SimpleNamespace(
+            method="leagle",
+            draft_model_config=SimpleNamespace(architectures=["LEagleDraftModel"]),
+            enable_adaptive_verification=False,
+            parallel_drafting=False,
+        ),
+        use_v2_model_runner=True,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL, pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            use_ubatching=False,
+        ),
+        attention_config=AttentionConfig(),
+        cache_config=SimpleNamespace(cache_dtype="auto", block_size=128, user_specified_block_size=True),
+        kv_transfer_config=None,
+    )
+    ascend = SimpleNamespace(
+        xlite_graph_config=SimpleNamespace(enabled=False),
+        kvpp_config=SimpleNamespace(size=1),
+        sparse_kv_offload_config=SimpleNamespace(enabled=False),
+        rl_config=SimpleNamespace(enabled=False),
+        enable_kv_nz=False,
+    )
+    profile = get_hardware_profile(AscendDeviceType.A2)
+    monkeypatch.setattr(platform, "get_current_hardware_profile", Mock(return_value=profile))
+    monkeypatch.setattr(platform, "get_ascend_config", lambda: ascend)
+    monkeypatch.setattr(platform, "enable_sp", lambda _: False)
+    monkeypatch.setattr(platform.envs_vllm, "VLLM_USE_BREAKABLE_CUDAGRAPH", False)
+    monkeypatch.setattr(platform.envs_vllm, "VLLM_KV_CACHE_LAYOUT", None)
+    monkeypatch.setattr(flash_attention_v3, "has_fa3_device_length_dispatch", Mock(return_value=True))
+    find_spec = platform.util.find_spec
+    monkeypatch.setattr(
+        platform.util, "find_spec", lambda name: object() if name == "flash_attn_npu_3" else find_spec(name)
+    )
+    monkeypatch.setattr("vllm.config.get_current_vllm_config", lambda: config)
+    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr("vllm.compilation.backends.model_tag", "backbone")
+    return config, ascend
+
+
+def test_leagle_fa3_is_opt_in_uncached_and_target_only(leagle_fa3, monkeypatch):
+    from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+
+    from vllm_ascend.attention.flash_attention_v3 import AscendFlashAttentionBackend as FA3Backend
+    from vllm_ascend.platform import NPUPlatform
+
+    config, _ = leagle_fa3
+    monkeypatch.setattr("vllm.platforms.current_platform", NPUPlatform)
+    _cached_get_attn_backend.cache_clear()
+    try:
+        assert get_attn_backend(128, torch.bfloat16, "auto") is AscendAttentionBackend
+        baseline_cache_info = _cached_get_attn_backend.cache_info()
+        assert baseline_cache_info.currsize == 1
+
+        config.additional_config["leagle_target_device_fa3"] = True
+        assert get_attn_backend(128, torch.bfloat16, "auto") is FA3Backend
+        with monkeypatch.context() as context:
+            context.setattr("vllm.compilation.backends.model_tag", "leagle")
+            assert get_attn_backend(128, torch.bfloat16, "auto") is AscendAttentionBackend
+        assert get_attn_backend(128, torch.bfloat16, "auto") is FA3Backend
+        assert _cached_get_attn_backend.cache_info() == baseline_cache_info
+
+        config.additional_config["leagle_target_device_fa3"] = False
+        assert get_attn_backend(128, torch.bfloat16, "auto") is AscendAttentionBackend
+        assert _cached_get_attn_backend.cache_info().hits == baseline_cache_info.hits + 1
+    finally:
+        _cached_get_attn_backend.cache_clear()
+
+
+def test_leagle_fa3_startup_accepts_supported_config(leagle_fa3):
+    from vllm_ascend.platform import _validate_leagle_target_device_fa3_config
+
+    _validate_leagle_target_device_fa3_config(*leagle_fa3)
+
+
+@pytest.mark.parametrize(
+    "section,field,value,error",
+    [
+        ("config", "use_v2_model_runner", False, "standard V2 runner"),
+        ("model_config", "architecture", "OtherModel", "Qwen3ForCausalLM"),
+        ("cache_config", "block_size", 64, "block_size=128"),
+        ("parallel_config", "pipeline_parallel_size", 2, "PP/PCP/DCP/KVPP"),
+        ("speculative_config", "enable_adaptive_verification", True, "sequential LEAGLE drafting"),
+    ],
+)
+def test_leagle_fa3_rejects_unsupported_startup_config(leagle_fa3, section, field, value, error):
+    from vllm_ascend.platform import _validate_leagle_target_device_fa3_config
+
+    config, ascend = leagle_fa3
+    setattr(config if section == "config" else getattr(config, section), field, value)
+    with pytest.raises(ValueError, match=error):
+        _validate_leagle_target_device_fa3_config(config, ascend)
+
+
+def test_leagle_fa3_requires_device_length_operator(leagle_fa3, monkeypatch):
+    from vllm_ascend.attention import flash_attention_v3
+    from vllm_ascend.platform import _validate_leagle_target_device_fa3_config
+
+    monkeypatch.setattr(flash_attention_v3, "has_fa3_device_length_dispatch", lambda: False)
+    with pytest.raises(ValueError, match="flash-attn-npu"):
+        _validate_leagle_target_device_fa3_config(*leagle_fa3)
+
+
+@pytest.mark.parametrize("overrides", [{"kv_cache_dtype": "fp8"}, {"has_sink": True}, {"use_non_causal": True}])
+def test_leagle_fa3_rejects_unsupported_attention(leagle_fa3, overrides):
+    from vllm_ascend.platform import NPUPlatform
+
+    config, _ = leagle_fa3
+    config.additional_config["leagle_target_device_fa3"] = True
+    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
+    with pytest.raises(ValueError, match="requires dense causal attention"):
+        NPUPlatform.get_attn_backend_cls(None, selector._replace(**overrides))
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
