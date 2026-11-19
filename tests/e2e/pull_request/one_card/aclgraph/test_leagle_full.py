@@ -282,12 +282,7 @@ def _serve(mode, target, draft, output_path, head_mode="none", tp="1"):
         if head_mode in ("quant",  "candidate_quant", "candidate_quant_direct"):
             kwargs["speculative_config"]["leagle_release_quantized_source"] = True
     if mode != "eager":
-        kwargs["compilation_config"] = dict(
-            cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16],
-            pass_config=dict(enable_sp=False),
-        )
-    else:
-        kwargs["compilation_config"] = dict(pass_config=dict(enable_sp=False))
+        kwargs["compilation_config"] = dict(cudagraph_mode=mode, cudagraph_capture_sizes=[4, 8, 16])
     llm = LLM(**kwargs)
     if mode != "eager":
         llm.collective_rpc(_count_target_replays)
@@ -413,7 +408,7 @@ def _serve_real_fa3(target, draft, draft_variant, backend, output_path):
         seed=42,
         speculative_config=spec,
         additional_config=dict(leagle_target_device_fa3=backend == "fa3"),
-        compilation_config=dict(cudagraph_mode="FULL", cudagraph_capture_sizes=[8], pass_config=dict(enable_sp=False)),
+        compilation_config=dict(cudagraph_mode="FULL", cudagraph_capture_sizes=[8]),
     )
     state = llm.collective_rpc(_target_attention_state)
     tokenizer = llm.get_tokenizer()

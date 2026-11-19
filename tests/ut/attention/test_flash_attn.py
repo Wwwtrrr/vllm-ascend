@@ -377,6 +377,7 @@ def test_qwen_dflash2_unsupported_settings_keep_existing_backend(qwen_dflash2_fa
 @pytest.fixture
 def leagle_fa3(monkeypatch):
     from vllm.config import CUDAGraphMode
+    from vllm.config.compilation import PassConfig
 
     from vllm_ascend import platform
     from vllm_ascend.attention import flash_attention_v3
@@ -393,9 +394,7 @@ def leagle_fa3(monkeypatch):
             parallel_drafting=False,
         ),
         use_v2_model_runner=True,
-        compilation_config=SimpleNamespace(
-            cudagraph_mode=CUDAGraphMode.FULL, pass_config=SimpleNamespace(enable_sp=False)
-        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL, pass_config=PassConfig()),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
             prefill_context_parallel_size=1,
@@ -463,6 +462,17 @@ def test_leagle_fa3_startup_accepts_supported_config(leagle_fa3):
     from vllm_ascend.platform import _validate_leagle_target_device_fa3_config
 
     _validate_leagle_target_device_fa3_config(*leagle_fa3)
+
+
+def test_leagle_fa3_rejects_active_sequence_parallelism(leagle_fa3, monkeypatch):
+    from vllm_ascend import platform
+
+    config, ascend = leagle_fa3
+    enable_sp = Mock(return_value=True)
+    monkeypatch.setattr(platform, "enable_sp", enable_sp)
+    with pytest.raises(ValueError, match="without sequence parallelism"):
+        platform._validate_leagle_target_device_fa3_config(config, ascend)
+    enable_sp.assert_called_once_with(config)
 
 
 @pytest.mark.parametrize(

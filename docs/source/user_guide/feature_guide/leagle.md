@@ -198,10 +198,7 @@ llm = LLM(
     tensor_parallel_size=2,
     enable_prefix_caching=False,
     enforce_eager=False,
-    compilation_config={
-        "cudagraph_mode": "FULL",
-        "pass_config": {"enable_sp": False},
-    },
+    compilation_config={"cudagraph_mode": "FULL"},
     speculative_config={
         "method": "leagle",
         "model": "/path/to/leagle/checkpoint",
@@ -279,8 +276,10 @@ For a Qwen3 target in FULL mode, add
 `additional_config={"leagle_target_device_fa3": True}` to `LLM`, with
 `block_size=128` and the attention backend left on automatic selection. This
 requires an A2/A3 device, FP16 or BF16 matching the KV dtype, and the standard
-V2 runner. The runner checks that every target attention group uses FA3 before
-skipping the CPU length snapshot.
+V2 runner. Sequence parallelism must be disabled. Leave Ascend FlashComm1 at
+its disabled default and remove `compilation_config.pass_config.enable_sp`
+from launch configs migrated from older revisions. The runner checks that
+every target attention group uses FA3 before skipping the CPU length snapshot.
 
 Target FA3 reads the rejection-corrected NPU sequence lengths and prepares
 its tiling metadata before replay. Regular request scheduling and the query

@@ -1895,7 +1895,6 @@ def _validate_leagle_target_device_fa3_config(config: VllmConfig, ascend: Ascend
         or parallel.decode_context_parallel_size != 1
         or ascend.kvpp_config.size != 1
         or parallel.use_ubatching
-        or compilation.pass_config.enable_sp
         or enable_sp(config)
     ):
         raise ValueError(f"{option} requires PP/PCP/DCP/KVPP sizes of 1 without sequence parallelism or microbatching.")
